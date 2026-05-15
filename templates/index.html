@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Email & City Scraper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css?v=5" />
+</head>
+<body class="bg-slate-100 min-h-screen">
+
+<!-- ── Hero ──────────────────────────────────────────────────────── -->
+<header class="bg-gradient-to-br from-blue-700 to-blue-900 text-white px-5 pt-10 pb-8">
+  <div class="max-w-4xl mx-auto">
+    <div class="flex items-start gap-4 mb-6">
+      <div class="bg-white/15 rounded-2xl p-3 flex-shrink-0">
+        <svg class="w-8 h-8" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+        </svg>
+      </div>
+      <div>
+        <h1 class="text-2xl sm:text-3xl font-extrabold tracking-tight">Email &amp; City Scraper</h1>
+        <p class="mt-1 text-blue-200 text-sm max-w-lg">Paste URLs or upload a spreadsheet — extracts emails &amp; city from footer and contact pages automatically.</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2 flex-wrap text-xs">
+      <span class="flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-full pl-1.5 pr-3 py-1">
+        <span class="bg-white/25 rounded-full w-5 h-5 flex items-center justify-center font-bold">1</span> Add URLs
+      </span>
+      <svg class="w-4 h-4 text-white/30" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>
+      <span class="flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-full pl-1.5 pr-3 py-1">
+        <span class="bg-white/25 rounded-full w-5 h-5 flex items-center justify-center font-bold">2</span> Click Scrape
+      </span>
+      <svg class="w-4 h-4 text-white/30" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>
+      <span class="flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-full pl-1.5 pr-3 py-1">
+        <span class="bg-white/25 rounded-full w-5 h-5 flex items-center justify-center font-bold">3</span> Export CSV
+      </span>
+    </div>
+  </div>
+</header>
+
+<!-- ── Main ───────────────────────────────────────────────────────── -->
+<main class="max-w-4xl mx-auto px-5 py-6 space-y-4">
+
+  <!-- Input card -->
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+
+    <!-- Tabs (inline onclick — no script dependency) -->
+    <div class="flex bg-gray-50 border-b border-slate-200 px-2 pt-2 gap-1">
+      <button id="tab-text" type="button" class="tab active flex items-center gap-1.5 px-4 py-2.5 text-sm rounded-t-lg transition-all"
+        onclick="document.getElementById('panel-text').style.display='block';document.getElementById('panel-file').style.display='none';document.getElementById('tab-text').classList.add('active');document.getElementById('tab-file').classList.remove('active');">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+        Paste URLs
+      </button>
+      <button id="tab-file" type="button" class="tab flex items-center gap-1.5 px-4 py-2.5 text-sm rounded-t-lg transition-all"
+        onclick="document.getElementById('panel-file').style.display='block';document.getElementById('panel-text').style.display='none';document.getElementById('tab-file').classList.add('active');document.getElementById('tab-text').classList.remove('active');">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+        Upload File
+      </button>
+    </div>
+
+    <!-- Panel: Paste URLs -->
+    <div id="panel-text" class="panel active p-5">
+      <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+        Paste website URLs — or a Google Sheet link
+      </label>
+
+      <!-- Google Sheets info banner -->
+      <div class="flex items-start gap-2 mb-2 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 text-xs text-emerald-800">
+        <svg class="w-4 h-4 flex-shrink-0 mt-0.5 text-emerald-600" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9 17v-2a4 4 0 014-4h6m0 0l-3-3m3 3l-3 3M5 7h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V9a2 2 0 012-2z"/>
+        </svg>
+        <span>
+          <strong>Tip:</strong> You can also paste a <strong>Google Sheet URL</strong> here — the app will find the
+          <code class="bg-emerald-100 px-1 rounded">Website</code> column and scrape every URL in it.
+          <em class="text-emerald-700">Sheet must be set to "Anyone with the link can view".</em>
+        </span>
+      </div>
+
+      <div class="relative">
+        <textarea id="url-input" rows="7" spellcheck="false"
+          class="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-mono text-gray-800 focus:outline-none focus:border-blue-500 focus:bg-white focus:ring-2 focus:ring-blue-100 resize-y transition leading-relaxed"
+          placeholder="Examples:&#10;&#10;https://example.com&#10;businesssite.com, anothersite.co.uk&#10;&#10;Or a Google Sheet link:&#10;https://docs.google.com/spreadsheets/d/...&#10;(must have a column named Website / URL / Site)"></textarea>
+        <span id="url-count" class="absolute bottom-2.5 right-3 text-[11px] text-gray-400 pointer-events-none">0 URLs</span>
+      </div>
+      <div class="flex items-center justify-between mt-3">
+        <button id="clear-btn" class="flex items-center gap-1.5 text-xs text-gray-400 hover:text-red-500 hover:bg-red-50 px-2 py-1.5 rounded-lg transition">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+          Clear
+        </button>
+        <button id="scrape-text-btn" class="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold px-5 py-2.5 rounded-xl transition shadow-sm">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path stroke-linecap="round" d="M21 21l-4.35-4.35"/></svg>
+          Scrape URLs
+        </button>
+      </div>
+    </div>
+
+    <!-- Panel: Upload File -->
+    <div id="panel-file" class="panel p-5">
+      <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">
+        Upload a spreadsheet containing URLs
+      </label>
+
+      <!-- Drop zone (no inline onclick) -->
+      <div id="drop-zone" class="border-2 border-dashed border-slate-300 rounded-2xl p-10 text-center cursor-pointer bg-slate-50 hover:border-blue-400 hover:bg-blue-50 transition-all group">
+        <input type="file" id="file-input" accept=".csv,.xls,.xlsx" style="display:none" />
+        <div class="text-slate-300 group-hover:text-blue-400 transition mb-3 flex justify-center">
+          <svg class="w-12 h-12" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+          </svg>
+        </div>
+        <p class="text-sm font-semibold text-gray-700 mb-1">Drag &amp; drop your file here</p>
+        <p class="text-xs text-gray-400 mb-4">or <span class="text-blue-600 underline">click to browse</span></p>
+        <div class="flex justify-center gap-2">
+          <span class="bg-slate-200 text-slate-500 text-[10px] font-bold tracking-widest px-2 py-1 rounded">.CSV</span>
+          <span class="bg-slate-200 text-slate-500 text-[10px] font-bold tracking-widest px-2 py-1 rounded">.XLS</span>
+          <span class="bg-slate-200 text-slate-500 text-[10px] font-bold tracking-widest px-2 py-1 rounded">.XLSX</span>
+        </div>
+      </div>
+
+      <!-- File preview (hidden until file picked) -->
+      <div id="file-preview" style="display:none" class="mt-3 flex items-center gap-3 bg-blue-50 border border-blue-200 rounded-xl px-4 py-3">
+        <svg class="w-5 h-5 text-blue-500 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+        <span id="file-name-text" class="flex-1 text-sm font-medium text-blue-800 truncate"></span>
+        <button id="remove-file-btn" class="text-blue-300 hover:text-blue-700 transition rounded p-0.5" title="Remove file">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
+
+      <div class="flex justify-end mt-3">
+        <button id="scrape-file-btn" disabled class="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold px-5 py-2.5 rounded-xl transition shadow-sm">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path stroke-linecap="round" d="M21 21l-4.35-4.35"/></svg>
+          Scrape File
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Progress -->
+  <div id="progress-card" style="display:none" class="bg-white rounded-2xl shadow-sm border border-blue-100 p-5">
+    <div class="flex items-center gap-4 mb-4">
+      <div class="w-10 h-10 rounded-full border-4 border-blue-100 border-t-blue-600 spin flex-shrink-0"></div>
+      <div>
+        <p id="progress-title" class="font-bold text-gray-800 text-sm">Scraping in progress…</p>
+        <p class="text-xs text-gray-400 mt-0.5">Checking homepage footer &amp; contact page for each URL</p>
+      </div>
+    </div>
+    <div class="bg-slate-100 rounded-full h-1.5 overflow-hidden">
+      <div class="bar-anim h-full bg-gradient-to-r from-blue-500 to-blue-400 rounded-full"></div>
+    </div>
+  </div>
+
+  <!-- Error -->
+  <div id="error-box" style="display:none" class="bg-red-50 border border-red-200 rounded-2xl px-4 py-3.5 flex items-start gap-3">
+    <svg class="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+    <span id="error-msg" class="text-sm text-red-700"></span>
+  </div>
+
+  <!-- Results -->
+  <div id="results-section" style="display:none" class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+
+    <!-- Stats bar -->
+    <div class="bg-gradient-to-r from-slate-50 to-blue-50 border-b border-slate-200 px-5 py-4 flex flex-wrap items-center gap-4">
+      <div class="text-center min-w-[70px]">
+        <div id="stat-sites" class="text-2xl font-extrabold text-blue-700">0</div>
+        <div class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 mt-0.5">Sites</div>
+      </div>
+      <div class="w-px h-9 bg-slate-200"></div>
+      <div class="text-center min-w-[70px]">
+        <div id="stat-emails" class="text-2xl font-extrabold text-emerald-600">0</div>
+        <div class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 mt-0.5">Emails</div>
+      </div>
+      <div class="w-px h-9 bg-slate-200"></div>
+      <div class="text-center min-w-[70px]">
+        <div id="stat-cities" class="text-2xl font-extrabold text-violet-600">0</div>
+        <div class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 mt-0.5">Cities</div>
+      </div>
+      <div class="flex-1"></div>
+      <button id="export-btn" class="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-4 py-2.5 rounded-xl transition">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+        Export CSV
+      </button>
+    </div>
+
+    <!-- Filter -->
+    <div class="border-b border-slate-100 px-4 py-3 flex items-center gap-3">
+      <div class="flex items-center gap-2 flex-1 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus-within:border-blue-400 focus-within:bg-white transition">
+        <svg class="w-3.5 h-3.5 text-gray-400 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path stroke-linecap="round" d="M21 21l-4.35-4.35"/></svg>
+        <input id="filter-input" type="text" placeholder="Filter by URL, email or city…"
+          class="flex-1 bg-transparent text-sm text-gray-700 outline-none placeholder-gray-400" />
+      </div>
+      <span id="showing-label" class="text-xs text-gray-400 whitespace-nowrap"></span>
+    </div>
+
+    <!-- Table -->
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="bg-slate-50 border-b border-slate-200">
+            <th class="text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3 w-10">#</th>
+            <th class="text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3 w-1/4">Website</th>
+            <th class="text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3">Email Address(es)</th>
+            <th class="text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3 w-1/5">City</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+      <div id="empty-filter" style="display:none" class="py-10 text-center text-sm text-gray-400">No results match your filter.</div>
+    </div>
+  </div>
+
+</main>
+
+<footer class="text-center py-5 text-xs text-gray-400 border-t border-slate-200 bg-white mt-4">
+  Scrapes homepage footer + contact page only — fast &amp; respectful to target sites.
+</footer>
+
+<div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 bg-gray-900 text-white text-xs font-semibold px-5 py-2.5 rounded-full shadow-lg pointer-events-none opacity-0 z-50 transition-opacity duration-200">
+  Copied to clipboard!
+</div>
+
+<script src="/static/script.js?v=4"></script>
+</body>
+</html>
