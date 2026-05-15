@@ -446,7 +446,14 @@ if results:
 
     # Filter
     q = st.text_input("🔎 Filter by URL, email, phone, social, or city", value="", key="filter")
-    df = pd.DataFrame(results)
+
+    # Normalize results — make sure every row has every column, even if the result
+    # was scraped before a new column (like "tech") was added
+    ALL_FIELDS = ["url", "company", "people", "emails", "phones",
+                  "socials", "city", "language", "tech", "contact_form"]
+    norm_results = [{f: r.get(f, "") for f in ALL_FIELDS} for r in results]
+    df = pd.DataFrame(norm_results)
+
     if q:
         ql = q.lower()
         df = df[df.apply(lambda row: any(ql in str(v).lower() for v in row.values), axis=1)]
