@@ -115,6 +115,23 @@ URL_LIKE_RE   = re.compile(
 # Matches: .gov, .gov.uk, .gov.in, .edu, .edu.au, .ac.uk, .org, .org.uk, etc.
 SKIP_TLD_RE = re.compile(r"(?:^|\.)(gov|edu|ac|org)(\.[a-z]{2,3})?$", re.IGNORECASE)
 
+# Chinese TLD — .cn or any .X.cn / .cn.X variant
+CHINESE_TLD_RE = re.compile(r"\.cn(?:\.[a-z]{2,3})?$|(?:^|\.)cn\.", re.IGNORECASE)
+
+# Major mainland-China cities (English + common Pinyin variants) + HK / Macao
+CHINESE_CITIES = {
+    "beijing", "peking", "shanghai", "guangzhou", "canton", "shenzhen", "tianjin",
+    "chongqing", "wuhan", "chengdu", "nanjing", "hangzhou", "xi'an", "xian",
+    "qingdao", "tsingtao", "shenyang", "harbin", "changsha", "dalian", "jinan",
+    "kunming", "fuzhou", "xiamen", "amoy", "suzhou", "ningbo", "wuxi", "foshan",
+    "dongguan", "zhengzhou", "hefei", "nanchang", "guiyang", "nanning",
+    "lanzhou", "yinchuan", "xining", "urumqi", "hohhot", "lhasa", "shantou",
+    "zhuhai", "wenzhou", "taiyuan", "shijiazhuang", "changchun", "nantong",
+    "yantai", "weifang", "linyi", "tangshan", "baoding", "luoyang", "zibo",
+    "haikou", "sanya", "huizhou", "zhongshan", "jiangmen", "putian", "quanzhou",
+    "hong kong", "hongkong", "kowloon", "macau", "macao",
+}
+
 
 def _matched_skip_tld(url: str) -> str | None:
     """Return the matched TLD suffix (e.g. '.gov', '.edu.au') if URL should be skipped."""
@@ -124,6 +141,23 @@ def _matched_skip_tld(url: str) -> str | None:
         return m.group(0) if m else None
     except Exception:
         return None
+
+
+def _is_chinese_url(url: str) -> bool:
+    """Match .cn and variants like .edu.cn, .com.cn, .gov.cn."""
+    try:
+        host = urlparse(url if "://" in url else "https://" + url).netloc.lower()
+        return bool(CHINESE_TLD_RE.search(host))
+    except Exception:
+        return False
+
+
+def _is_chinese_city(city: str) -> bool:
+    """Match city names belonging to mainland China, HK, or Macao."""
+    if not city:
+        return False
+    c = re.sub(r"[^\w\s']", "", city).strip().lower()
+    return c in CHINESE_CITIES
 
 
 # ── Smart column / URL extraction (same logic as Flask app.py) ─────
@@ -383,6 +417,12 @@ skip_noncommercial = st.sidebar.checkbox(
     help="When ON, .gov / .edu / .ac / .org (and country variants like .gov.uk, "
          ".edu.au) are filtered out before scraping. Turn OFF to scrape them too.",
 )
+skip_chinese = st.sidebar.checkbox(
+    "Skip Chinese websites",
+    value=True,
+    help="Drops URLs ending in .cn (and .edu.cn, .gov.cn, .com.cn etc.) BEFORE scraping, "
+         "and removes any result whose detected City is a known mainland-China / HK / Macao city.",
+)
 st.sidebar.markdown("---")
 
 
@@ -477,6 +517,17 @@ if scrape_clicked:
                     kept.append(u)
             urls = kept
 
+        # ── Filter out Chinese URLs (.cn variants) if toggle is on ─
+        skipped_chinese_urls: list[str] = []
+        if skip_chinese:
+            kept = []
+            for u in urls:
+                if _is_chinese_url(u):
+                    skipped_chinese_urls.append(u)
+                else:
+                    kept.append(u)
+            urls = kept
+
         capped = max(0, len(urls) - MAX_URLS)
         if capped:
             urls = urls[:MAX_URLS]
@@ -493,6 +544,8 @@ if scrape_clicked:
                 by_tld[t] = by_tld.get(t, 0) + 1
             tld_summary = ", ".join(f"{n} `{t}`" for t, n in sorted(by_tld.items()))
             warning_msgs.append(f"**{len(skipped_tld)}** non-commercial skipped ({tld_summary})")
+        if skipped_chinese_urls:
+            warning_msgs.append(f"**{len(skipped_chinese_urls)}** Chinese `.cn` skipped")
         if capped:
             warning_msgs.append(f"**{capped}** truncated (max {MAX_URLS})")
 
@@ -540,6 +593,18 @@ if scrape_clicked:
 
         progress.empty()
         ticker.empty()
+
+        # ── Post-processing: drop results whose city is Chinese ──
+        if skip_chinese:
+            before_n = len(results)
+            results = [r for r in results if not _is_chinese_city(r.get("city", ""))]
+            dropped = before_n - len(results)
+            if dropped:
+                st.info(
+                    f"🇨🇳 Dropped **{dropped}** result"
+                    f"{'s' if dropped != 1 else ''} after scraping — city detected "
+                    "as mainland China / Hong Kong / Macao."
+                )
 
         # ── Post-processing: Gmail addresses first ────────────────
         results = _sort_gmail_first(results)
