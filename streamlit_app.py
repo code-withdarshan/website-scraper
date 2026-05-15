@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +26,7 @@ import requests
 import streamlit as st
 import xlrd
 
-from scraper import scrape_url
+from scraper import scrape_url, strip_tracking_params
 
 # ── Page config ────────────────────────────────────────────────────
 st.set_page_config(
@@ -70,6 +71,36 @@ if "source_name" not in st.session_state: st.session_state.source_name = None
 MAX_WORKERS = 8
 MAX_URLS    = 500
 HIST_MAX    = 5
+
+# Public usage counter (abacus.jasoncameron.dev — free, no auth, no PII)
+COUNTER_NS  = "email-scraper-darshan"   # unique to this app
+COUNTER_KEY = "scrapes"
+COUNTER_URL_BUMP = f"https://abacus.jasoncameron.dev/hit/{COUNTER_NS}/{COUNTER_KEY}"
+COUNTER_URL_GET  = f"https://abacus.jasoncameron.dev/get/{COUNTER_NS}/{COUNTER_KEY}"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _get_counter() -> int | None:
+    """Fetch current counter value. Cached 60s so we don't hammer the API."""
+    try:
+        r = requests.get(COUNTER_URL_GET, timeout=3)
+        if r.ok:
+            return int(r.json().get("value", 0))
+    except Exception:
+        pass
+    return None
+
+
+def _bump_counter() -> int | None:
+    """Increment counter and return new value. Fail silently if offline."""
+    try:
+        r = requests.get(COUNTER_URL_BUMP, timeout=3)
+        if r.ok:
+            _get_counter.clear()   # invalidate cache so display refreshes
+            return int(r.json().get("value", 0))
+    except Exception:
+        pass
+    return None
 
 WEBSITE_COL_RE = re.compile(
     r"^\s*(website|web\s*site|site|url|domain|homepage|web|link)s?\s*$", re.I
@@ -223,10 +254,13 @@ def _safe_filename(name: str) -> str:
 
 
 def _normalize_url(u: str) -> str:
-    """Lowercase host, drop trailing slash & www, for accurate duplicate detection."""
+    """Lowercase host, drop trailing slash, www, and tracking params for dedup."""
+    u = strip_tracking_params(u)
     parsed = urlparse(u if "://" in u else "https://" + u)
-    host = (parsed.netloc or u).lower().lstrip("www.")
-    return host.rstrip("/")
+    host = (parsed.netloc or u).lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return (host + (parsed.path or "")).rstrip("/")
 
 
 def _estimate_time(unique_urls: list[str]) -> tuple[int, int]:
@@ -371,6 +405,9 @@ if scrape_clicked:
         st.session_state.results = results
         st.session_state.failed  = failed
 
+        # Bump public usage counter (no PII, just a tick per scrape submission)
+        _bump_counter()
+
         # save to history
         st.session_state.history.insert(0, {
             "when":        datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -394,11 +431,16 @@ if results:
     total_phones = sum(len([p for p in (r["phones"] or "").split(",") if p.strip()]) for r in results)
     total_cities = sum(1 for r in results if r["city"])
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Sites",  len(results))
-    m2.metric("Emails", total_emails)
-    m3.metric("Phones", total_phones)
-    m4.metric("Cities", total_cities)
+    total_companies = sum(1 for r in results if r.get("company"))
+    total_forms     = sum(1 for r in results if r.get("contact_form"))
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Sites",     len(results))
+    m2.metric("Emails",    total_emails)
+    m3.metric("Phones",    total_phones)
+    m4.metric("Companies", total_companies)
+    m5.metric("Cities",    total_cities)
+    m6.metric("Has form",  total_forms)
 
     # Filter
     q = st.text_input("🔎 Filter by URL, email, phone, social, or city", value="", key="filter")
@@ -407,11 +449,20 @@ if results:
         ql = q.lower()
         df = df[df.apply(lambda row: any(ql in str(v).lower() for v in row.values), axis=1)]
 
-    # Friendly column names
+    # Friendly column names & order
     df = df.rename(columns={
-        "url": "Website", "emails": "Emails",
-        "phones": "Phones", "socials": "Socials", "city": "City",
+        "url":          "Website",
+        "company":      "Company",
+        "emails":       "Emails",
+        "phones":       "Phones",
+        "socials":      "Socials",
+        "city":         "City",
+        "language":     "Lang",
+        "contact_form": "Has form",
     })
+    preferred = ["Website", "Company", "Emails", "Phones", "City",
+                 "Lang", "Has form", "Socials"]
+    df = df[[c for c in preferred if c in df.columns]]
 
     st.dataframe(
         df,
@@ -467,7 +518,61 @@ if failed:
 
 # ── Sidebar: history ───────────────────────────────────────────────
 with st.sidebar:
+    # ── Public usage counter ─────────────────────────────────────
+    total = _get_counter()
+    if total is not None:
+        st.markdown(
+            f"<div style='padding:.6rem .85rem; background:#eff6ff; border:1px solid #bfdbfe; "
+            f"border-radius:.5rem; margin-bottom:1rem; text-align:center;'>"
+            f"<div style='font-size:1.4rem; font-weight:800; color:#1d4ed8;'>{total:,}</div>"
+            f"<div style='font-size:.7rem; color:#64748b; text-transform:uppercase; letter-spacing:.05em;'>"
+            f"total scrapes worldwide</div></div>",
+            unsafe_allow_html=True,
+        )
+
     st.markdown("### 🕘 History")
+
+    # ── Download / Restore history ──────────────────────────────
+    with st.expander("💾 Save / Restore"):
+        # Save
+        if st.session_state.history:
+            hist_json = json.dumps(
+                st.session_state.history,
+                indent=2, default=str, ensure_ascii=False,
+            )
+            st.download_button(
+                "⬇ Download history (.json)",
+                data=hist_json,
+                file_name=f"scraper-history-{datetime.now().strftime('%Y%m%d-%H%M')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        else:
+            st.caption("Nothing to save yet.")
+
+        # Restore
+        restored_file = st.file_uploader(
+            "Restore from .json",
+            type=["json"],
+            key="hist_restore",
+            label_visibility="collapsed",
+        )
+        if restored_file is not None:
+            try:
+                loaded = json.loads(restored_file.read())
+                if isinstance(loaded, list) and all(isinstance(h, dict) for h in loaded):
+                    # Merge: new history first, dedup by 'when' timestamp
+                    existing_keys = {h.get("when") for h in st.session_state.history}
+                    incoming = [h for h in loaded if h.get("when") not in existing_keys]
+                    st.session_state.history = (incoming + st.session_state.history)[:HIST_MAX * 4]
+                    st.success(f"Restored {len(incoming)} new entries (total: {len(st.session_state.history)})")
+                else:
+                    st.error("Invalid history file format.")
+            except json.JSONDecodeError:
+                st.error("Could not parse JSON file.")
+            except Exception as e:
+                st.error(f"Could not restore: {e}")
+
     if not st.session_state.history:
         st.caption("No previous scrapes yet.")
     else:
@@ -497,15 +602,19 @@ with st.sidebar:
         """
         <div style="font-size:.78rem; color:#64748b; line-height:1.5;">
           <div style="margin-bottom:.4rem;">
-            🤖 <b>Respects robots.txt</b> — URLs disallowed by a site's
-            <code>robots.txt</code> are silently skipped.
+            🤖 <b>Respects robots.txt</b> — disallowed URLs silently skipped.
           </div>
           <div style="margin-bottom:.4rem;">
-            🐢 <b>Per-domain rate limited</b> — 1 request/second per domain.
+            🐢 <b>Per-domain rate limited</b> — 1 req/sec per domain.
+          </div>
+          <div style="margin-bottom:.4rem;">
+            🧹 <b>Tracking params stripped</b> — <code>utm_*</code>, <code>fbclid</code>, etc.
+          </div>
+          <div style="margin-bottom:.4rem;">
+            🛡 <b>Auto-retries</b> with browser headers on 403 / Cloudflare.
           </div>
           <div>
-            📄 Only scrapes <b>homepage</b>, <b>contact</b>, and <b>about</b> pages —
-            never crawls deeper.
+            📄 Only scrapes <b>homepage</b>, <b>contact</b>, <b>about</b> pages.
           </div>
         </div>
         """,

@@ -20,11 +20,17 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
+
+# python-whois is optional — gracefully degrade if missing
+try:
+    import whois as _whois_lib
+except ImportError:
+    _whois_lib = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -41,6 +47,31 @@ HEADERS = {
 }
 DEFAULT_TIMEOUT = 12
 MAX_RETRIES = 2
+
+# Extra "browser-like" headers used on the 403 retry to slip past basic Cloudflare checks
+BROWSER_HEADERS = {
+    **HEADERS,
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36"
+    ),
+    "Sec-CH-UA":          '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-CH-UA-Mobile":   "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+    "Sec-Fetch-Dest":     "document",
+    "Sec-Fetch-Mode":     "navigate",
+    "Sec-Fetch-Site":     "none",
+    "Sec-Fetch-User":     "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "DNT":               "1",
+}
+
+# URL tracking params to strip before fetching (Google Analytics, FB, marketing, etc.)
+TRACKING_PARAM_RE = re.compile(
+    r"^(utm_|fbclid$|gclid$|msclkid$|mc_|_ga$|ref$|ref_src$|source$|"
+    r"campaign$|hsCtaTracking$|hsa_|igshid$|trk$|share$)",
+    re.IGNORECASE,
+)
 
 # ── Patterns ────────────────────────────────────────────────────────
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.I)
@@ -112,6 +143,20 @@ def _is_junk_email(email: str) -> bool:
     return False
 
 
+# ── URL helpers ────────────────────────────────────────────────────
+def strip_tracking_params(url: str) -> str:
+    """Remove utm_*/fbclid/gclid/etc. so the same page isn't fetched twice."""
+    try:
+        parsed = urlparse(url)
+        if not parsed.query:
+            return url
+        clean = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+                 if not TRACKING_PARAM_RE.match(k)]
+        return urlunparse(parsed._replace(query=urlencode(clean)))
+    except Exception:
+        return url
+
+
 # ── robots.txt cache (one parser per domain, fetched once) ─────────
 _robots_cache: dict[str, RobotFileParser | None] = {}
 _robots_lock = threading.Lock()
@@ -173,28 +218,36 @@ def _is_safe_url(url: str) -> bool:
 def _fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> str | None:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+    url = strip_tracking_params(url)
     if not _is_safe_url(url):
         return None
     if not _allowed_by_robots(url):
         log.info("Blocked by robots.txt: %s", url)
         return None
-    last_err = None
-    for attempt in range(MAX_RETRIES):
+
+    # Attempt 1: normal headers
+    # Attempt 2: full browser fingerprint headers (Cloudflare bypass attempt)
+    # Plus retries on transient errors
+    for attempt in range(MAX_RETRIES + 1):
+        hdrs = BROWSER_HEADERS if attempt > 0 else HEADERS
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            resp = requests.get(url, headers=hdrs, timeout=timeout, allow_redirects=True)
+            # If forbidden on attempt 0, fall through to retry with browser headers
+            if resp.status_code == 403 and attempt == 0:
+                log.debug("403 on %s — retrying with browser headers", url)
+                time.sleep(0.3)
+                continue
             resp.raise_for_status()
-            # Skip non-HTML responses
             ctype = resp.headers.get("Content-Type", "").lower()
             if ctype and "html" not in ctype and "xml" not in ctype:
                 return None
             return resp.text
         except (requests.Timeout, requests.ConnectionError) as exc:
-            last_err = exc
+            log.debug("fetch transient err %s: %s", url, exc)
             time.sleep(0.5 * (attempt + 1))
         except Exception as exc:
-            last_err = exc
+            log.debug("fetch err %s: %s", url, exc)
             break
-    log.debug("Fetch failed %s: %s", url, last_err)
     return None
 
 
@@ -336,6 +389,131 @@ def _extract_city(soup: BeautifulSoup, raw_html: str) -> str:
     return ""
 
 
+# ── Language detection ─────────────────────────────────────────────
+def _extract_language(soup: BeautifulSoup) -> str:
+    """Read <html lang> or content-language meta. Returns ISO code like 'en' / 'es'."""
+    html = soup.find("html")
+    if html and html.get("lang"):
+        lang = html["lang"].strip().split("-")[0].lower()
+        if 1 < len(lang) <= 3 and lang.isalpha():
+            return lang
+    for meta in soup.find_all("meta"):
+        name = (meta.get("http-equiv", "") or meta.get("name", "") or "").lower()
+        if name in ("content-language", "language"):
+            v = (meta.get("content", "") or "").strip().split(",")[0].split("-")[0].lower()
+            if 1 < len(v) <= 3 and v.isalpha():
+                return v
+    return ""
+
+
+# ── Company name detection ─────────────────────────────────────────
+def _extract_company(soup: BeautifulSoup) -> str:
+    """Best-effort company name from og:site_name → schema.org → <title>."""
+    # 1. og:site_name (Open Graph)
+    og = soup.find("meta", attrs={"property": "og:site_name"})
+    if og and og.get("content"):
+        v = og["content"].strip()
+        if 1 < len(v) < 80:
+            return v
+
+    # 2. application-name meta
+    app_meta = soup.find("meta", attrs={"name": "application-name"})
+    if app_meta and app_meta.get("content"):
+        v = app_meta["content"].strip()
+        if 1 < len(v) < 80:
+            return v
+
+    # 3. Schema.org Organization "name"
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "{}")
+        except Exception:
+            continue
+        for node in _walk_jsonld_objects(data):
+            t = node.get("@type") if isinstance(node, dict) else None
+            if t in ("Organization", "LocalBusiness", "Corporation") and node.get("name"):
+                v = str(node["name"]).strip()
+                if 1 < len(v) < 80:
+                    return v
+
+    # 4. <title> — strip common suffixes like " | Home" or " - Welcome"
+    title = soup.find("title")
+    if title and title.string:
+        v = title.string.strip()
+        v = re.split(r"\s+[|\-–—]\s+", v)[0].strip()
+        if 1 < len(v) < 80:
+            return v
+    return ""
+
+
+def _walk_jsonld_objects(node):
+    """Yield every dict in a (possibly nested) JSON-LD structure."""
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _walk_jsonld_objects(v)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_jsonld_objects(item)
+
+
+# ── WHOIS company fallback ─────────────────────────────────────────
+_whois_cache: dict[str, str] = {}
+_whois_lock  = threading.Lock()
+
+
+def _whois_company(domain: str) -> str:
+    """Look up WHOIS registrant org for a domain. Cached. Returns '' on failure."""
+    if not _whois_lib or not domain:
+        return ""
+    domain = domain.lower().lstrip(".")
+    # Strip subdomains — only TLD lookups work
+    parts = domain.split(".")
+    if len(parts) > 2:
+        domain = ".".join(parts[-2:])
+
+    with _whois_lock:
+        if domain in _whois_cache:
+            return _whois_cache[domain]
+    try:
+        w = _whois_lib.whois(domain)
+        org = w.get("org") or w.get("organization") or w.get("registrant_organization")
+        if isinstance(org, list):
+            org = org[0] if org else ""
+        org = (org or "").strip()
+        # WHOIS often returns "REDACTED FOR PRIVACY" etc.
+        if org and not re.search(r"redacted|privacy|whoisguard|domains by proxy", org, re.I):
+            with _whois_lock:
+                _whois_cache[domain] = org
+            return org
+    except Exception as exc:
+        log.debug("WHOIS lookup failed for %s: %s", domain, exc)
+    with _whois_lock:
+        _whois_cache[domain] = ""
+    return ""
+
+
+# ── Contact form detection ─────────────────────────────────────────
+def _has_contact_form(soup: BeautifulSoup) -> bool:
+    """Returns True if the page looks like it has a working contact form."""
+    for form in soup.find_all("form"):
+        action = (form.get("action") or "").lower()
+        clas   = " ".join(form.get("class", [])).lower()
+        idv    = (form.get("id") or "").lower()
+        # Strong signals — form labeled as contact / inquiry / quote
+        if any(s in (action + clas + idv) for s in
+               ("contact", "inquiry", "enquir", "quote", "message", "lead")):
+            return True
+        # Weaker signal — has both an email-type input and a textarea (message)
+        has_email_input = bool(form.find("input", attrs={"type": "email"})) or bool(
+            form.find("input", attrs={"name": re.compile(r"email|e-mail", re.I)})
+        )
+        has_textarea = bool(form.find("textarea"))
+        if has_email_input and has_textarea:
+            return True
+    return False
+
+
 # ── Discover sub-pages ──────────────────────────────────────────────
 def _find_subpage(soup: BeautifulSoup, base_url: str, pattern: re.Pattern) -> str | None:
     base_domain = urlparse(base_url).netloc
@@ -366,6 +544,7 @@ def scrape_url(url: str) -> dict | None:
     if not raw:
         return None
     base_url = raw if raw.startswith(("http://", "https://")) else "https://" + raw
+    base_url = strip_tracking_params(base_url)
 
     # ── 1. Homepage ─────────────────────────────────────────────
     home_html = _fetch(base_url)
@@ -373,10 +552,13 @@ def scrape_url(url: str) -> dict | None:
         return None
     home_soup = BeautifulSoup(home_html, "html.parser")
 
-    emails  = _emails_from_soup(home_soup, home_html)
-    phones  = _phones_from_soup(home_soup)
-    socials = _socials_from_soup(home_soup, home_html)
-    city    = _extract_city(home_soup, home_html)
+    emails        = _emails_from_soup(home_soup, home_html)
+    phones        = _phones_from_soup(home_soup)
+    socials       = _socials_from_soup(home_soup, home_html)
+    city          = _extract_city(home_soup, home_html)
+    company       = _extract_company(home_soup)
+    language      = _extract_language(home_soup)
+    contact_form  = _has_contact_form(home_soup)
 
     # ── 2. Contact page ─────────────────────────────────────────
     contact_url = _find_subpage(home_soup, base_url, CONTACT_LINK_RE)
@@ -388,8 +570,10 @@ def scrape_url(url: str) -> dict | None:
             phones  |= _phones_from_soup(c_soup)
             for k, v in _socials_from_soup(c_soup, c_html).items():
                 socials.setdefault(k, v)
-            if not city:
-                city = _extract_city(c_soup, c_html)
+            if not city:    city    = _extract_city(c_soup, c_html)
+            if not company: company = _extract_company(c_soup)
+            if _has_contact_form(c_soup):
+                contact_form = True
 
     # ── 3. About / Team page (only if no email yet) ──────────────
     clean_emails = [e for e in emails if not _is_junk_email(e)]
@@ -403,19 +587,26 @@ def scrape_url(url: str) -> dict | None:
                 phones  |= _phones_from_soup(a_soup)
                 for k, v in _socials_from_soup(a_soup, a_html).items():
                     socials.setdefault(k, v)
-                if not city:
-                    city = _extract_city(a_soup, a_html)
+                if not city:    city    = _extract_city(a_soup, a_html)
+                if not company: company = _extract_company(a_soup)
         clean_emails = [e for e in emails if not _is_junk_email(e)]
+
+    # ── WHOIS fallback if no company name found yet ──────────────
+    domain = urlparse(base_url).netloc or raw
+    if not company:
+        company = _whois_company(domain)
 
     # ── Final filter — must have at least one real email ─────────
     if not clean_emails:
         return None
 
-    display_url = urlparse(base_url).netloc or raw
     return {
-        "url":     display_url,
-        "emails":  ", ".join(sorted(clean_emails)),
-        "phones":  ", ".join(_dedup_phones(phones)) if phones else "",
-        "socials": ", ".join(f"{k}: {v}" for k, v in sorted(socials.items())),
-        "city":    city,
+        "url":          domain,
+        "company":      company,
+        "emails":       ", ".join(sorted(clean_emails)),
+        "phones":       ", ".join(_dedup_phones(phones)) if phones else "",
+        "socials":      ", ".join(f"{k}: {v}" for k, v in sorted(socials.items())),
+        "city":         city,
+        "language":     language,
+        "contact_form": "yes" if contact_form else "",
     }
