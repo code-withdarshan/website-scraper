@@ -702,6 +702,208 @@ def _whois_company(domain: str) -> str:
     return ""
 
 
+# ── Business niche / category detection ────────────────────────────
+# Schema.org LocalBusiness subtypes mapped to friendly labels
+SCHEMA_TYPE_TO_NICHE = {
+    "dentist":               "Dentist",
+    "dentistoffice":         "Dentist",
+    "physician":             "Doctor / Medical",
+    "medicalclinic":         "Doctor / Medical",
+    "medicalorganization":   "Doctor / Medical",
+    "hospital":              "Doctor / Medical",
+    "pharmacy":              "Pharmacy",
+    "optician":              "Optometrist",
+    "veterinarycare":        "Veterinarian",
+    "legalservice":          "Lawyer / Legal",
+    "attorney":              "Lawyer / Legal",
+    "notary":                "Lawyer / Legal",
+    "realestateagent":       "Real Estate",
+    "restaurant":            "Restaurant / Food",
+    "cafeorcoffeeshop":      "Restaurant / Food",
+    "fastfoodrestaurant":    "Restaurant / Food",
+    "bakery":                "Restaurant / Food",
+    "bar":                   "Restaurant / Food",
+    "barorpub":              "Restaurant / Food",
+    "architectoffice":       "Architect",
+    "architect":             "Architect",
+    "autorepair":            "Auto Repair",
+    "autobodyshop":          "Auto Repair",
+    "autopartsstore":        "Auto Parts",
+    "autodealer":            "Car Dealer",
+    "automotivebusiness":    "Auto / Automotive",
+    "plumber":               "Plumber",
+    "electrician":           "Electrician",
+    "roofingcontractor":     "Roofer",
+    "hvacbusiness":          "HVAC",
+    "beautysalon":           "Salon / Spa",
+    "hairsalon":             "Salon / Spa",
+    "dayspa":                "Salon / Spa",
+    "nailsalon":             "Salon / Spa",
+    "accountingservice":     "Accountant",
+    "financialservice":      "Financial Services",
+    "insuranceagency":       "Insurance",
+    "school":                "Education / School",
+    "preschool":             "Education / School",
+    "highschool":            "Education / School",
+    "collegeoruniversity":   "Education / School",
+    "educationalorganization":"Education / School",
+    "hotel":                 "Hotel / Lodging",
+    "lodgingbusiness":       "Hotel / Lodging",
+    "bedandbreakfast":       "Hotel / Lodging",
+    "resort":                "Hotel / Lodging",
+    "generalcontractor":     "Construction",
+    "housekeeper":           "Cleaning Services",
+    "cleaning":              "Cleaning Services",
+    "exerciseplaceholder":   "Fitness / Gym",
+    "healthclub":            "Fitness / Gym",
+    "gym":                   "Fitness / Gym",
+    "sportsactivitylocation":"Fitness / Gym",
+    "petstore":              "Pet Services",
+    "funeralservices":       "Funeral Services",
+    "tattooparlor":          "Tattoo / Body Art",
+    "movietheater":          "Entertainment",
+    "stadiumorarena":        "Entertainment",
+    "casino":                "Entertainment",
+    "store":                 "Retail",
+    "shoppingcenter":        "Retail",
+    "groceryorsupermarket":  "Grocery",
+    "electricalservicelocator":"Electrician",
+    "softwareapplication":   "Tech / SaaS",
+}
+
+# Keyword-based niche scoring — used when no schema.org type is present
+NICHE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "Dentist":           ("dentist", "dental", "tooth", "teeth", "cavity", "crown", "implant",
+                          "orthodontic", "invisalign", "veneer", "hygienist", "dds", "dmd",
+                          "root canal", "wisdom tooth", "smile", "oral surgery"),
+    "Doctor / Medical":  ("physician", "doctor", "clinic", "patient", "medical practice",
+                          "primary care", "specialist", "diagnosis", "appointment",
+                          "healthcare", "general practitioner", "internal medicine"),
+    "Veterinarian":      ("veterinarian", "veterinary", "vet clinic", "animal hospital",
+                          "puppy", "kitten", "pet care", "spay", "neuter"),
+    "Lawyer / Legal":    ("attorney", "lawyer", "law firm", "litigation", "esquire", "esq.",
+                          "legal counsel", "law office", "criminal defense", "personal injury",
+                          "divorce attorney"),
+    "Real Estate":       ("realtor", "real estate", "mls", "homes for sale", "buyer agent",
+                          "seller agent", "listing", "property for sale", "open house",
+                          "real estate agent", "brokerage"),
+    "Restaurant / Food": ("restaurant", "menu", "reservation", "cuisine", "chef", "bistro",
+                          "cafe", "diner", "takeout", "delivery menu", "wine list",
+                          "appetizer", "entree", "dessert menu"),
+    "Architect":         ("architect", "architecture", "architectural", "aia member",
+                          "design firm", "building design", "residential design",
+                          "commercial architecture", "blueprint", "schematic design"),
+    "Auto Repair":       ("auto repair", "mechanic", "automotive service", "transmission",
+                          "brake repair", "engine repair", "oil change", "muffler",
+                          "tire rotation", "diagnostics"),
+    "Car Dealer":        ("car dealer", "used car", "new car", "auto sales", "test drive",
+                          "trade-in", "financing", "pre-owned", "dealership", "vin"),
+    "Plumber":           ("plumber", "plumbing", "drain cleaning", "leak repair",
+                          "water heater", "sewer", "faucet", "burst pipe", "sump pump"),
+    "Electrician":       ("electrician", "electrical service", "wiring", "circuit breaker",
+                          "panel upgrade", "outlet", "voltage", "rewiring"),
+    "Roofer":            ("roofer", "roofing", "shingles", "gutter", "roof repair",
+                          "roof replacement", "asphalt shingle", "metal roof"),
+    "HVAC":              ("hvac", "heating", "cooling", "air conditioning", "ac repair",
+                          "furnace", "heat pump", "thermostat", "ductwork"),
+    "Salon / Spa":       ("salon", "spa", "haircut", "barber", "stylist", "massage",
+                          "facial", "manicure", "pedicure", "waxing", "blowout"),
+    "Accountant":        ("accountant", "accounting firm", "cpa", "bookkeeping",
+                          "tax preparation", "tax planning", "audit service", "payroll"),
+    "Photographer":      ("photographer", "photography", "portrait session", "wedding photo",
+                          "headshot", "engagement shoot", "family portrait", "boudoir"),
+    "Fitness / Gym":     ("gym", "fitness center", "personal trainer", "yoga studio",
+                          "pilates", "crossfit", "workout", "bootcamp", "spinning class"),
+    "Education / School":("school", "academy", "tutor", "curriculum", "teacher", "education",
+                          "course catalog", "enroll", "tuition"),
+    "Hotel / Lodging":   ("hotel", "resort", "lodge", "inn", "guest room", "amenities",
+                          "check-in", "book a room", "rate per night", "bed and breakfast"),
+    "Construction":      ("construction", "general contractor", "remodeling", "renovation",
+                          "home improvement", "building contractor"),
+    "Cleaning Services": ("cleaning service", "house cleaning", "janitorial", "maid service",
+                          "office cleaning", "deep clean"),
+    "Landscaping":       ("landscaping", "lawn care", "garden design", "tree service",
+                          "mulch", "irrigation", "sod"),
+    "Insurance":         ("insurance", "policy", "premium", "coverage", "auto insurance",
+                          "home insurance", "life insurance", "claim"),
+    "Pet Services":      ("dog walker", "pet grooming", "kennel", "pet boarding",
+                          "doggy daycare", "pet sitter"),
+    "Funeral Services":  ("funeral", "cremation", "memorial service", "obituary", "burial",
+                          "funeral home"),
+    "Tech / SaaS":       ("saas", "api", "developer", "developers", "documentation",
+                          "software platform", "integration", "sdk", "webhook",
+                          "open source", "rest api", "developer tools", "no-code"),
+    "Fintech / Payments":("payments", "payment processing", "fintech", "merchant",
+                          "subscription billing", "financial infrastructure",
+                          "fraud prevention", "billing platform", "credit card processing",
+                          "stripe", "paypal", "ach"),
+    "Agency / Marketing":("marketing agency", "advertising agency", "seo service",
+                          "creative agency", "branding agency", "social media management",
+                          "ppc", "lead generation"),
+    "E-commerce / Retail":("add to cart", "buy now", "free shipping", "checkout",
+                          "shopping cart", "in stock", "out of stock", "product catalog"),
+    "Travel Agency":     ("travel agency", "tour package", "vacation package", "guided tour",
+                          "itinerary", "destination"),
+}
+
+
+def _detect_niche(soup: BeautifulSoup, raw_html: str) -> str:
+    # ── 1. Schema.org @type (highest confidence) ─────────────────
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "{}")
+        except Exception:
+            continue
+        for node in _walk_jsonld_objects(data):
+            if not isinstance(node, dict):
+                continue
+            t = node.get("@type")
+            for tname in (t if isinstance(t, list) else [t]):
+                if isinstance(tname, str):
+                    label = SCHEMA_TYPE_TO_NICHE.get(tname.lower())
+                    if label:
+                        return label
+
+    # ── 2. Keyword scoring with weighted page zones ──────────────
+    # High-signal zone: <title>, <h1>, meta description, meta keywords, og:description.
+    # A site is much more likely to be ABOUT a niche if its title/H1 says so —
+    # body text alone is misleading (e.g. a template marketplace listing medical templates).
+    high_text = []
+    if (t := soup.find("title")) and t.string:
+        high_text.append(t.string)
+    for h1 in soup.find_all("h1"):
+        high_text.append(h1.get_text(" ", strip=True))
+    for meta in soup.find_all("meta"):
+        name = (meta.get("name", "") or meta.get("property", "") or "").lower()
+        if name in ("description", "keywords", "og:description", "og:title"):
+            high_text.append(meta.get("content", "") or "")
+    high_blob = " ".join(high_text).lower()
+
+    body_blob = re.sub(r"\s+", " ", soup.get_text(" ", strip=True).lower())
+    if not body_blob:
+        return ""
+
+    best_niche = ""
+    best_total = 0
+    best_high  = 0
+    for niche, keywords in NICHE_KEYWORDS.items():
+        hi_hits = sum(1 for kw in keywords if kw in high_blob)
+        lo_hits = sum(1 for kw in keywords if kw in body_blob)
+        # Weighted total: each title/meta match counts as 3 body matches
+        total = hi_hits * 3 + lo_hits
+        if total > best_total:
+            best_total = total
+            best_high  = hi_hits
+            best_niche = niche
+
+    # Confidence rules:
+    #   • at least 1 keyword in title/h1/meta AND total ≥ 3   → confident
+    #   • OR very strong body signal (no high-zone hit but ≥ 6 in body)
+    if (best_high >= 1 and best_total >= 3) or best_total >= 6:
+        return best_niche
+    return ""
+
+
 # ── Tech-stack detection ───────────────────────────────────────────
 # Pattern → display name. First match wins inside each category to keep
 # the output short (e.g. "WordPress" without all 50 plugins).
@@ -888,6 +1090,7 @@ def scrape_url(url: str) -> dict | None:
     # (not from the full page — too many false positives)
     people        = list(_extract_people(home_soup, allow_full_page=False))
     tech          = _detect_tech(home_soup, home_html)
+    niche         = _detect_niche(home_soup, home_html)
 
     # ── 2. Contact page ─────────────────────────────────────────
     contact_url = _find_subpage(home_soup, base_url, CONTACT_LINK_RE)
@@ -953,6 +1156,7 @@ def scrape_url(url: str) -> dict | None:
     return {
         "url":          domain,
         "company":      company,
+        "niche":        niche,
         "people":       ", ".join(seen_people[:5]),
         "emails":       ", ".join(sorted(clean_emails)),
         "phones":       ", ".join(_dedup_phones(phones)) if phones else "",

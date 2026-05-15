@@ -111,6 +111,20 @@ URL_LIKE_RE   = re.compile(
     r"^(https?://)?([a-z0-9][a-z0-9\-]*\.)+[a-z]{2,}(/.*)?$", re.I
 )
 
+# TLDs to skip by default — government, education, non-profit organisations
+# Matches: .gov, .gov.uk, .gov.in, .edu, .edu.au, .ac.uk, .org, .org.uk, etc.
+SKIP_TLD_RE = re.compile(r"(?:^|\.)(gov|edu|ac|org)(\.[a-z]{2,3})?$", re.IGNORECASE)
+
+
+def _matched_skip_tld(url: str) -> str | None:
+    """Return the matched TLD suffix (e.g. '.gov', '.edu.au') if URL should be skipped."""
+    try:
+        host = urlparse(url if "://" in url else "https://" + url).netloc.lower()
+        m = SKIP_TLD_RE.search(host)
+        return m.group(0) if m else None
+    except Exception:
+        return None
+
 
 # ── Smart column / URL extraction (same logic as Flask app.py) ─────
 def _looks_like_url(v: str) -> bool:
@@ -363,12 +377,39 @@ if scrape_clicked:
         urls = list(seen.values())
 
         dupes = len(raw_urls) - len(urls)
+
+        # ── Filter out .gov / .edu / .org / .ac if toggle is on ─
+        skipped_tld: list[tuple[str, str]] = []
+        if skip_noncommercial:
+            kept = []
+            for u in urls:
+                tld = _matched_skip_tld(u)
+                if tld:
+                    skipped_tld.append((u, tld))
+                else:
+                    kept.append(u)
+            urls = kept
+
         capped = max(0, len(urls) - MAX_URLS)
         if capped:
             urls = urls[:MAX_URLS]
 
         # ── Pre-flight info banners ─────────────────────────────
-        info_cols = st.columns(3 if (dupes or capped) else 2)
+        # Build the list of side-banner messages dynamically
+        warning_msgs = []
+        if dupes:
+            warning_msgs.append(f"**{dupes}** duplicate{'s' if dupes != 1 else ''} removed")
+        if skipped_tld:
+            # Group by TLD for a clean summary
+            by_tld: dict[str, int] = {}
+            for _, t in skipped_tld:
+                by_tld[t] = by_tld.get(t, 0) + 1
+            tld_summary = ", ".join(f"{n} `{t}`" for t, n in sorted(by_tld.items()))
+            warning_msgs.append(f"**{len(skipped_tld)}** non-commercial skipped ({tld_summary})")
+        if capped:
+            warning_msgs.append(f"**{capped}** truncated (max {MAX_URLS})")
+
+        info_cols = st.columns(3 if warning_msgs else 2)
         with info_cols[0]:
             st.info(f"📋 **{len(urls)}** unique URL{'s' if len(urls) != 1 else ''} to scrape")
         secs, domains = _estimate_time(urls)
@@ -376,14 +417,14 @@ if scrape_clicked:
             mins = secs // 60
             time_str = f"~{mins}m {secs % 60}s" if mins else f"~{secs}s"
             st.info(f"⏱️ Estimated time: **{time_str}** across {domains} domain{'s' if domains != 1 else ''}")
-        if dupes or capped:
+        if warning_msgs:
             with info_cols[2]:
-                msgs = []
-                if dupes:
-                    msgs.append(f"**{dupes}** duplicate{'s' if dupes != 1 else ''} removed")
-                if capped:
-                    msgs.append(f"**{capped}** truncated (max {MAX_URLS})")
-                st.warning("ℹ️ " + " · ".join(msgs))
+                st.warning("ℹ️ " + " · ".join(warning_msgs))
+
+        # If filtering left us with nothing, stop here
+        if not urls:
+            st.error("All URLs were filtered out. Untick *Skip non-commercial domains* in the sidebar to include them.")
+            st.stop()
 
         results, failed = [], []
         progress = st.progress(0.0, text=f"Scraping 0 / {len(urls)}…")
@@ -454,22 +495,34 @@ if results:
     total_companies = sum(1 for r in results if r.get("company"))
     total_forms     = sum(1 for r in results if r.get("contact_form"))
     total_people    = sum(1 for r in results if r.get("people"))
+    total_niches    = len({r.get("niche") for r in results if r.get("niche")})
 
-    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-    m1.metric("Sites",     len(results))
-    m2.metric("Emails",    total_emails)
-    m3.metric("Phones",    total_phones)
-    m4.metric("Companies", total_companies)
-    m5.metric("Key people", total_people)
-    m6.metric("Cities",    total_cities)
-    m7.metric("Has form",  total_forms)
+    m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+    m1.metric("Sites",      len(results))
+    m2.metric("Emails",     total_emails)
+    m3.metric("Phones",     total_phones)
+    m4.metric("Companies",  total_companies)
+    m5.metric("Niches",     total_niches)
+    m6.metric("Key people", total_people)
+    m7.metric("Cities",     total_cities)
+    m8.metric("Has form",   total_forms)
 
-    # Filter
-    q = st.text_input("🔎 Filter by URL, email, phone, social, or city", value="", key="filter")
+    # Filter row — text search + niche dropdown
+    fc1, fc2 = st.columns([3, 1])
+    with fc1:
+        q = st.text_input("🔎 Filter by URL, email, phone, social, or city",
+                          value="", key="filter")
+    with fc2:
+        all_niches = sorted({r.get("niche") for r in results if r.get("niche")})
+        niche_pick = st.selectbox(
+            "Niche",
+            options=["All"] + all_niches,
+            key="niche_filter",
+        )
 
     # Normalize results — make sure every row has every column, even if the result
-    # was scraped before a new column (like "tech") was added
-    ALL_FIELDS = ["url", "company", "people", "emails", "phones",
+    # was scraped before a new column (like "tech" or "niche") was added
+    ALL_FIELDS = ["url", "company", "niche", "people", "emails", "phones",
                   "socials", "city", "language", "tech", "contact_form"]
     norm_results = [{f: r.get(f, "") for f in ALL_FIELDS} for r in results]
     df = pd.DataFrame(norm_results)
@@ -477,11 +530,14 @@ if results:
     if q:
         ql = q.lower()
         df = df[df.apply(lambda row: any(ql in str(v).lower() for v in row.values), axis=1)]
+    if niche_pick != "All":
+        df = df[df["niche"] == niche_pick]
 
     # Friendly column names & order
     df = df.rename(columns={
         "url":          "Website",
         "company":      "Company",
+        "niche":        "Niche",
         "people":       "Key People",
         "emails":       "Emails",
         "phones":       "Phones",
@@ -491,7 +547,7 @@ if results:
         "tech":         "Built With",
         "contact_form": "Has form",
     })
-    preferred = ["Website", "Company", "Key People", "Emails", "Phones",
+    preferred = ["Website", "Company", "Niche", "Key People", "Emails", "Phones",
                  "City", "Built With", "Lang", "Has form", "Socials"]
     df = df[[c for c in preferred if c in df.columns]]
 
@@ -549,6 +605,16 @@ if failed:
 
 # ── Sidebar: history ───────────────────────────────────────────────
 with st.sidebar:
+    # ── Filters ─────────────────────────────────────────────────
+    st.markdown("### ⚙️ Filters")
+    skip_noncommercial = st.checkbox(
+        "Skip non-commercial domains",
+        value=True,
+        help="When ON, .gov / .edu / .ac / .org (and country variants like .gov.uk, "
+             ".edu.au) are filtered out before scraping. Turn OFF to scrape them too.",
+    )
+    st.markdown("---")
+
     # ── Public usage counter ─────────────────────────────────────
     total = _get_counter()
     if total is not None:
