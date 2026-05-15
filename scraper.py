@@ -581,9 +581,18 @@ def _is_real_name(s: str) -> bool:
     return True
 
 
-def _extract_people(soup: BeautifulSoup) -> list[tuple[str, str]]:
-    """Returns list of (name, title) pairs. Deduplicates by name (lowercased)."""
-    people: dict[str, str] = {}   # lowercased-name -> "Name|Title"
+def _extract_people(soup: BeautifulSoup, allow_full_page: bool = False) -> list[tuple[str, str]]:
+    """
+    Extract key people.
+      • JSON-LD structured data (Organization.founder, .employee, .ceo) is always
+        scanned — it's authoritative, low false-positive risk.
+      • Text-pattern matching is restricted to About / Team / Leadership / Staff
+        / Founder sections (by id or class). If no such section exists and
+        `allow_full_page=False`, text matching is skipped entirely.
+      • Pass `allow_full_page=True` only when the soup IS an About/Team page
+        already (i.e. we navigated to a /about URL).
+    """
+    people: dict[str, str] = {}
 
     def _add(name: str, title: str):
         name = re.sub(r"\s+", " ", name).strip(" ,.;:")
@@ -591,11 +600,10 @@ def _extract_people(soup: BeautifulSoup) -> list[tuple[str, str]]:
             return
         title = title.strip(" ,.;:").title() if title else ""
         key = name.lower()
-        # Prefer entries that have a title
         if key not in people or (title and "|" in people[key] and not people[key].split("|", 1)[1]):
             people[key] = f"{name}|{title}"
 
-    # 1. JSON-LD: Organization.founder, .employee, .ceo
+    # ── 1. JSON-LD (always, anywhere on page — authoritative) ────
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "{}")
@@ -605,10 +613,8 @@ def _extract_people(soup: BeautifulSoup) -> list[tuple[str, str]]:
             if not isinstance(node, dict):
                 continue
             t = node.get("@type")
-            # Direct Person entry with jobTitle
             if t == "Person" and node.get("name"):
                 _add(str(node["name"]), str(node.get("jobTitle", "") or ""))
-            # Organization.founder, .employee, .ceo refs
             for role_key in ("founder", "founders", "employee", "ceo", "owner"):
                 for person in _as_list(node.get(role_key)):
                     if isinstance(person, dict) and person.get("name"):
@@ -617,21 +623,26 @@ def _extract_people(soup: BeautifulSoup) -> list[tuple[str, str]]:
                     elif isinstance(person, str):
                         _add(person, role_key.capitalize())
 
-    # 2. Text patterns — only scan likely sections to limit noise
-    candidate_regions = (
-        soup.find_all(["section", "article", "main"]) +
-        soup.find_all(class_=re.compile(r"team|founder|about|leadership|staff", re.I)) +
-        soup.find_all(id=re.compile(r"team|founder|about|leadership|staff", re.I))
+    # ── 2. Text patterns — STRICTLY only About/Team sections ─────
+    about_team_sections = (
+        soup.find_all(class_=re.compile(r"\b(team|founder|about|leadership|staff)\b", re.I)) +
+        soup.find_all(id=re.compile(r"\b(team|founder|about|leadership|staff)\b", re.I))
     )
-    # Fall back to whole page if no candidate sections
-    targets = candidate_regions or [soup]
+
+    if about_team_sections:
+        targets = about_team_sections
+    elif allow_full_page:
+        # Caller asserted this is the About page → whole page is fair game
+        targets = [soup]
+    else:
+        # No about/team section on this page → don't scan text at all
+        targets = []
 
     for region in targets:
         text = region.get_text(" ", strip=True)
         for m in TITLE_THEN_NAME_RE.finditer(text):
             full = m.group(0)
             name = m.group(1)
-            # Extract the leading title word from match
             title_match = re.match(
                 r"(founded\s+by|founder|owner|ceo|president|director|principal|partner|chairman|managing\s+director)",
                 full, re.I,
@@ -643,12 +654,11 @@ def _extract_people(soup: BeautifulSoup) -> list[tuple[str, str]]:
         for m in NAME_THEN_TITLE_RE.finditer(text):
             _add(m.group(1), m.group(2))
 
-    # Format: "Name (Title)" or just "Name" if no title
     out = []
     for entry in people.values():
         n, t = entry.split("|", 1)
         out.append(f"{n} ({t})" if t else n)
-    return [(p,) for p in out]   # tuple wrapper for uniform return type
+    return [(p,) for p in out]
 
 
 def _as_list(v):
@@ -874,7 +884,9 @@ def scrape_url(url: str) -> dict | None:
     company       = _extract_company(home_soup)
     language      = _extract_language(home_soup)
     contact_form  = _has_contact_form(home_soup)
-    people        = list(_extract_people(home_soup))
+    # Key people: only extract from about/team SECTIONS on the homepage
+    # (not from the full page — too many false positives)
+    people        = list(_extract_people(home_soup, allow_full_page=False))
     tech          = _detect_tech(home_soup, home_html)
 
     # ── 2. Contact page ─────────────────────────────────────────
@@ -891,7 +903,9 @@ def scrape_url(url: str) -> dict | None:
             if not company: company = _extract_company(c_soup)
             if _has_contact_form(c_soup):
                 contact_form = True
-            people.extend(_extract_people(c_soup))
+            # Contact page: still only labeled about/team sections — never the
+            # whole contact page (it's a contact page, not a team page)
+            people.extend(_extract_people(c_soup, allow_full_page=False))
 
     # ── 3. About / Team page (if no email yet OR no people yet) ──
     clean_emails = [e for e in emails if not _is_junk_email(e)]
@@ -907,7 +921,8 @@ def scrape_url(url: str) -> dict | None:
                     socials.setdefault(k, v)
                 if not city:    city    = _extract_city(a_soup, a_html)
                 if not company: company = _extract_company(a_soup)
-                people.extend(_extract_people(a_soup))
+                # About page: whole page is fair game — it IS the about page
+                people.extend(_extract_people(a_soup, allow_full_page=True))
         clean_emails = [e for e in emails if not _is_junk_email(e)]
 
     # ── WHOIS fallback if no company name found yet ──────────────
@@ -919,13 +934,18 @@ def scrape_url(url: str) -> dict | None:
     if not clean_emails:
         return None
 
-    # Dedup people: each was wrapped in a 1-tuple ("Name (Title)",)
+    # Dedup people + drop any "name" that matches the company itself
     seen_people = []
     seen_keys: set[str] = set()
+    company_norm = re.sub(r"[^\w]+", "", (company or "")).lower()
     for p in people:
         s = p[0] if isinstance(p, tuple) else str(p)
-        key = re.sub(r"\s*\(.*\)\s*$", "", s).lower()  # name part for dedup
+        name_only = re.sub(r"\s*\(.*\)\s*$", "", s)
+        key = name_only.lower()
         if key in seen_keys:
+            continue
+        # Skip if the "person name" is actually the company name
+        if company_norm and re.sub(r"[^\w]+", "", name_only).lower() == company_norm:
             continue
         seen_keys.add(key)
         seen_people.append(s)

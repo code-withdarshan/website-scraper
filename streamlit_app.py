@@ -263,6 +263,17 @@ def _normalize_url(u: str) -> str:
     return (host + (parsed.path or "")).rstrip("/")
 
 
+def _has_gmail(result: dict) -> bool:
+    """True if any email in this row ends with @gmail.com or @googlemail.com."""
+    emails = (result.get("emails") or "").lower()
+    return "@gmail.com" in emails or "@googlemail.com" in emails
+
+
+def _sort_gmail_first(results: list[dict]) -> list[dict]:
+    """Stable sort: rows whose emails include any Gmail address go to the top."""
+    return sorted(results, key=lambda r: 0 if _has_gmail(r) else 1)
+
+
 def _estimate_time(unique_urls: list[str]) -> tuple[int, int]:
     """
     Rough wall-clock estimate in seconds + unique domain count.
@@ -401,6 +412,15 @@ if scrape_clicked:
 
         progress.empty()
         ticker.empty()
+
+        # ── Post-processing: Gmail addresses first ────────────────
+        results = _sort_gmail_first(results)
+        gmail_count = sum(1 for r in results if _has_gmail(r))
+        if gmail_count:
+            st.success(
+                f"✉️ {gmail_count} site{'s' if gmail_count != 1 else ''} "
+                f"with Gmail address{'es' if gmail_count != 1 else ''} sorted to the top."
+            )
 
         st.session_state.results = results
         st.session_state.failed  = failed
