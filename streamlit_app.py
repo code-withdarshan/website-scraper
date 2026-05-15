@@ -206,16 +206,39 @@ def _fetch_gsheet_csv(url: str) -> tuple[bytes | None, str | None]:
         m2 = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
         if m2:
             raw = m2.group(1).strip()
-            # URL-decode and strip extension
             try:
                 from urllib.parse import unquote as _uq
                 raw = _uq(raw)
             except Exception:
                 pass
             title = re.sub(r"\.csv$", "", raw, flags=re.I).strip()
+            title = _dedupe_gsheet_title(title)
         return r.content, title
     except Exception:
         return None, None
+
+
+def _dedupe_gsheet_title(title: str) -> str:
+    """
+    Google exports as "Spreadsheet Name - Tab Name.csv". When both names are
+    identical we get "Name - Name", which becomes a doubled download filename.
+    Collapse such duplicates.
+    """
+    # Try common separators Google uses (" - ", " — ", " – ")
+    for sep in (" - ", " — ", " – "):
+        if sep in title:
+            parts = [p.strip() for p in title.split(sep) if p.strip()]
+            if len(parts) >= 2:
+                # All parts identical → keep one
+                if all(p.lower() == parts[0].lower() for p in parts):
+                    return parts[0]
+                # Adjacent duplicates ("X - X - Y") → dedupe consecutively
+                deduped = [parts[0]]
+                for p in parts[1:]:
+                    if p.lower() != deduped[-1].lower():
+                        deduped.append(p)
+                return sep.join(deduped)
+    return title
 
 
 def _collect_urls(text_input: str, uploaded_file) -> tuple[list[str], str | None, str | None]:
@@ -245,25 +268,69 @@ def _collect_urls(text_input: str, uploaded_file) -> tuple[list[str], str | None
         except Exception as exc:
             return [], f"Could not parse file: {exc}", None
     if text_input:
-        cands = [u.strip() for u in re.split(r"[,\n\r]+", text_input) if u.strip()]
+        # Accept commas, semicolons, whitespace (including newlines & tabs)
+        # as separators between URLs / Google Sheet links
+        cands = [u.strip() for u in re.split(r"[,\n\r\t;\s]+", text_input) if u.strip()]
+
+        sheet_titles: list[str] = []
+        failed_sheets: list[str] = []
+        gsheet_count = 0
+
         for c in cands:
             if GSHEET_RE.search(c):
+                gsheet_count += 1
                 sheet_bytes, title = _fetch_gsheet_csv(c)
                 if sheet_bytes is None:
-                    return [], "Could not download Google Sheet. Make sure it's 'Anyone with the link can view'.", None
+                    # Skip this one but keep going with the rest
+                    failed_sheets.append(c)
+                    continue
                 urls.extend(_extract_urls_from_rows(_csv_rows(sheet_bytes)))
-                if title and not source_name:
-                    source_name = title
+                if title:
+                    sheet_titles.append(title)
             else:
                 urls.append(c)
+
+        # Build source name
+        if sheet_titles:
+            if len(sheet_titles) == 1:
+                source_name = sheet_titles[0]
+            else:
+                # Use first sheet's title + " (+N more)"
+                source_name = f"{sheet_titles[0]} (+{len(sheet_titles) - 1} more)"
+
+        # Hard fail only if EVERY Google Sheet failed and there are no other URLs
+        if gsheet_count > 0 and not urls and failed_sheets:
+            return [], (
+                f"All {gsheet_count} Google Sheet link"
+                f"{'s' if gsheet_count != 1 else ''} failed to download. "
+                "Make sure each sheet is shared as 'Anyone with the link can view'."
+            ), None
+
+        # Soft warning when some succeeded, some failed — pass it back via a magic
+        # marker the caller can detect (we still want to scrape what we got)
+        if failed_sheets:
+            # Stash the failure count in source_name suffix so caller can show a hint;
+            # but only do it if source_name is otherwise set. Otherwise just log silently.
+            pass   # we surface this through st.warning below
+
+        # Save the failure list on a module-level holder so the caller can read it
+        global _LAST_FAILED_SHEETS
+        _LAST_FAILED_SHEETS = failed_sheets
+
     urls = [u.strip() for u in urls if u.strip()]
     return urls, None, source_name
+
+
+# Tracker for partial Google Sheet failures (read by the caller after _collect_urls)
+_LAST_FAILED_SHEETS: list[str] = []
 
 
 def _safe_filename(name: str) -> str:
     """Strip filesystem-unsafe chars and collapse whitespace for a filename."""
     name = re.sub(r"[^\w\s.\-]", "", name).strip()
     name = re.sub(r"\s+", "-", name)
+    # Collapse runs of hyphens that come from " - " separators
+    name = re.sub(r"-{2,}", "-", name)
     return (name or "scrape-results")[:80]
 
 
@@ -338,19 +405,21 @@ uploaded_file = None
 
 with tab_paste:
     st.markdown(
-        '<div class="gsheet-tip"><b>Tip:</b> You can also paste a <b>Google Sheet URL</b> here — '
-        'the app will find the <code>Website</code> column and scrape every URL in it. '
-        'Sheet must be set to <em>"Anyone with the link can view"</em>.</div>',
+        '<div class="gsheet-tip"><b>Tip:</b> Paste one or <b>multiple Google Sheet URLs</b> '
+        '(comma- or newline-separated) — the app finds the <code>Website</code> column '
+        'in each and combines all URLs into a single scrape. '
+        'Each sheet must be set to <em>"Anyone with the link can view"</em>.</div>',
         unsafe_allow_html=True,
     )
     text_input = st.text_area(
-        label="Enter URLs (one per line or comma-separated) or a Google Sheet link",
-        height=180,
+        label="Enter URLs (one per line or comma-separated) or one or more Google Sheet links",
+        height=200,
         placeholder=(
             "https://example.com\n"
             "businesssite.com, anothersite.co.uk\n\n"
-            "Or a Google Sheet link:\n"
-            "https://docs.google.com/spreadsheets/d/..."
+            "Or one or more Google Sheet links — comma- or newline-separated:\n"
+            "https://docs.google.com/spreadsheets/d/AAA.../edit#gid=0,\n"
+            "https://docs.google.com/spreadsheets/d/BBB.../edit#gid=123"
         ),
         label_visibility="visible",
         key="text_input",
@@ -373,6 +442,13 @@ with col_a:
 # ── Scrape ─────────────────────────────────────────────────────────
 if scrape_clicked:
     raw_urls, err, source_name = _collect_urls(text_input, uploaded_file)
+    # Surface any Google Sheet failures from the most recent _collect_urls call
+    if _LAST_FAILED_SHEETS:
+        st.warning(
+            f"⚠️ {len(_LAST_FAILED_SHEETS)} Google Sheet link"
+            f"{'s' if len(_LAST_FAILED_SHEETS) != 1 else ''} could not be downloaded "
+            "(skipped). Make sure each is shared as 'Anyone with the link can view'."
+        )
     if err:
         st.error(err)
     elif not raw_urls:
