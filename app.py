@@ -1,85 +1,113 @@
+"""
+Email & City Scraper — Flask backend.
+"""
+from __future__ import annotations
+
 import csv
 import io
+import json
+import logging
 import os
 import re
+import threading
+import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 import openpyxl
 import requests
 import xlrd
-from flask import Flask, jsonify, render_template, request, Response
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 from scraper import scrape_url
 
+# ── Logging ────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("app")
+
+# ── Flask app ──────────────────────────────────────────────────────
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload limit
-app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0           # static files: no cache
-app.config["TEMPLATES_AUTO_RELOAD"] = True            # reload templates on change
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
 
 
 @app.after_request
 def _no_cache(resp):
-    """Force browser to always fetch the freshest HTML / JS / CSS."""
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"]        = "no-cache"
     resp.headers["Expires"]       = "0"
     return resp
 
-MAX_WORKERS = 8
-MAX_URLS = 500
 
-# Header cell labels that should be treated as the "website" column
+MAX_WORKERS    = 8
+MAX_URLS       = 500
+DOMAIN_COOLDOWN = 1.0   # seconds between requests to the same domain
+
+# ── Header / URL detection ─────────────────────────────────────────
 WEBSITE_COL_RE = re.compile(
-    r"^\s*(website|web\s*site|site|url|domain|homepage|web|link)s?\s*$",
-    re.IGNORECASE,
+    r"^\s*(website|web\s*site|site|url|domain|homepage|web|link)s?\s*$", re.I
 )
-
-GSHEET_RE = re.compile(
-    r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]+)", re.IGNORECASE
-)
-GSHEET_GID_RE = re.compile(r"[#?&]gid=(\d+)", re.IGNORECASE)
-
-URL_LIKE_RE = re.compile(
-    r"^(https?://)?([a-z0-9][a-z0-9\-]*\.)+[a-z]{2,}(/.*)?$", re.IGNORECASE
+GSHEET_RE     = re.compile(r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]+)", re.I)
+GSHEET_GID_RE = re.compile(r"[#?&]gid=(\d+)", re.I)
+URL_LIKE_RE   = re.compile(
+    r"^(https?://)?([a-z0-9][a-z0-9\-]*\.)+[a-z]{2,}(/.*)?$", re.I
 )
 
 
-# ---------------------------------------------------------------------------
-# Smart column detection
-# ---------------------------------------------------------------------------
+# ── Per-domain rate limiter ────────────────────────────────────────
+class DomainThrottle:
+    """One slot per domain — serializes requests so the same site isn't hammered."""
+    def __init__(self, cooldown: float):
+        self.cooldown = cooldown
+        self._last_hit: dict[str, float] = defaultdict(float)
+        self._locks:    dict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._meta_lock = threading.Lock()
 
-def _looks_like_url(value: str) -> bool:
-    return bool(URL_LIKE_RE.match(value.strip()))
+    def acquire(self, url: str) -> None:
+        domain = urlparse(url if "://" in url else "https://" + url).netloc.lower()
+        with self._meta_lock:
+            lock = self._locks[domain]
+        with lock:
+            elapsed = time.time() - self._last_hit[domain]
+            if elapsed < self.cooldown:
+                time.sleep(self.cooldown - elapsed)
+            self._last_hit[domain] = time.time()
+
+
+throttle = DomainThrottle(DOMAIN_COOLDOWN)
+
+
+def _throttled_scrape(url: str) -> dict | None:
+    throttle.acquire(url)
+    return scrape_url(url)
+
+
+# ── Smart column detection ─────────────────────────────────────────
+def _looks_like_url(v: str) -> bool:
+    return bool(URL_LIKE_RE.match(v.strip()))
 
 
 def _extract_urls_from_rows(rows: list[list[str]]) -> list[str]:
-    """
-    Given a list of rows (each a list of cell strings), find the column that
-    holds website URLs and return all values from it.
-      1. If a header row has a cell matching WEBSITE_COL_RE, use that column.
-      2. Otherwise pick the column with the highest count of URL-like values.
-      3. Fall back to "any cell that looks like a URL" across the sheet.
-    """
     if not rows:
         return []
-
-    # Strategy 1 — labelled header
     header = rows[0]
-    target_col = None
-    for idx, cell in enumerate(header):
-        if WEBSITE_COL_RE.match(cell or ""):
-            target_col = idx
-            break
-
-    # Strategy 2 — column with most URL-like values
+    target_col = next(
+        (i for i, c in enumerate(header) if WEBSITE_COL_RE.match(c or "")),
+        None,
+    )
     if target_col is None:
-        col_count = max(len(r) for r in rows)
-        scores = [0] * col_count
+        cols = max(len(r) for r in rows)
+        scores = [0] * cols
         for r in rows:
-            for idx, cell in enumerate(r):
-                if cell and _looks_like_url(cell):
-                    scores[idx] += 1
+            for i, c in enumerate(r):
+                if c and _looks_like_url(c):
+                    scores[i] += 1
         if max(scores, default=0) >= 2:
             target_col = scores.index(max(scores))
 
@@ -88,96 +116,103 @@ def _extract_urls_from_rows(rows: list[list[str]]) -> list[str]:
         start = 1 if WEBSITE_COL_RE.match(header[target_col] or "") else 0
         for r in rows[start:]:
             if target_col < len(r):
-                val = (r[target_col] or "").strip()
-                if val and _looks_like_url(val):
-                    urls.append(val)
-
-    # Strategy 3 — last resort scan
+                v = (r[target_col] or "").strip()
+                if v and _looks_like_url(v):
+                    urls.append(v)
     if not urls:
         for r in rows:
-            for cell in r:
-                val = (cell or "").strip()
-                if val and _looks_like_url(val):
-                    urls.append(val)
-
+            for c in r:
+                v = (c or "").strip()
+                if v and _looks_like_url(v):
+                    urls.append(v)
     return urls
 
 
-# ---------------------------------------------------------------------------
-# File parsers
-# ---------------------------------------------------------------------------
-
-def _csv_to_rows(data: bytes) -> list[list[str]]:
+# ── File parsers ───────────────────────────────────────────────────
+def _csv_rows(data: bytes) -> list[list[str]]:
     text = data.decode("utf-8-sig", errors="replace")
     return [list(row) for row in csv.reader(io.StringIO(text))]
 
 
-def _xls_to_rows(data: bytes) -> list[list[str]]:
+def _xls_rows(data: bytes) -> list[list[str]]:
     wb = xlrd.open_workbook(file_contents=data)
-    rows: list[list[str]] = []
-    for sheet in wb.sheets():
-        for rx in range(sheet.nrows):
-            rows.append([str(sheet.cell_value(rx, cx)).strip() for cx in range(sheet.ncols)])
-    return rows
+    out = []
+    for s in wb.sheets():
+        for r in range(s.nrows):
+            out.append([str(s.cell_value(r, c)).strip() for c in range(s.ncols)])
+    return out
 
 
-def _xlsx_to_rows(data: bytes) -> list[list[str]]:
+def _xlsx_rows(data: bytes) -> list[list[str]]:
     wb = openpyxl.load_workbook(filename=io.BytesIO(data), data_only=True)
-    rows: list[list[str]] = []
-    for sheet in wb.worksheets:
-        for row in sheet.iter_rows(values_only=True):
-            rows.append([("" if cell is None else str(cell)).strip() for cell in row])
-    return rows
+    out = []
+    for s in wb.worksheets:
+        for r in s.iter_rows(values_only=True):
+            out.append([("" if c is None else str(c)).strip() for c in r])
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Google Sheets
-# ---------------------------------------------------------------------------
-
-def _is_gsheet_url(value: str) -> bool:
-    return bool(GSHEET_RE.search(value))
+# ── Google Sheets ──────────────────────────────────────────────────
+def _is_gsheet(u: str) -> bool:
+    return bool(GSHEET_RE.search(u))
 
 
-def _fetch_gsheet_as_csv(url: str) -> bytes | None:
-    """Convert a Google Sheets share URL to its CSV export and download it."""
+def _fetch_gsheet_csv(url: str) -> bytes | None:
     m = GSHEET_RE.search(url)
     if not m:
         return None
-    sheet_id = m.group(1)
-    gid_match = GSHEET_GID_RE.search(url)
-    gid = gid_match.group(1) if gid_match else "0"
-    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    sid = m.group(1)
+    gid = (GSHEET_GID_RE.search(url) or [None, "0"])[1] if GSHEET_GID_RE.search(url) else "0"
+    export_url = f"https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}"
     try:
-        resp = requests.get(export_url, timeout=20, allow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
+        r = requests.get(export_url, timeout=20, allow_redirects=True)
+        r.raise_for_status()
+        return r.content
     except Exception:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Scrape orchestration
-# ---------------------------------------------------------------------------
+# ── URL collection ─────────────────────────────────────────────────
+def _collect_urls(request) -> tuple[list[str], str | None]:
+    """Returns (urls, error_message)."""
+    urls: list[str] = []
 
-def _scrape_all(urls: list[str]) -> list[dict]:
+    if "file" in request.files:
+        f = request.files["file"]
+        fn = (f.filename or "").lower()
+        data = f.read()
+        try:
+            if fn.endswith(".csv"):
+                urls = _extract_urls_from_rows(_csv_rows(data))
+            elif fn.endswith(".xlsx"):
+                urls = _extract_urls_from_rows(_xlsx_rows(data))
+            elif fn.endswith(".xls"):
+                urls = _extract_urls_from_rows(_xls_rows(data))
+            else:
+                return [], "Unsupported file type. Use CSV or XLS/XLSX."
+        except Exception as exc:
+            return [], f"Could not parse file: {exc}"
+    else:
+        body = request.get_json(silent=True) or {}
+        raw = body.get("urls", "") or request.form.get("urls", "")
+        cands = [u.strip() for u in re.split(r"[,\n\r]+", raw) if u.strip()]
+        for c in cands:
+            if _is_gsheet(c):
+                sheet = _fetch_gsheet_csv(c)
+                if sheet is None:
+                    return [], (
+                        "Could not download the Google Sheet. "
+                        "Make sure it's shared as 'Anyone with the link can view'."
+                    )
+                urls.extend(_extract_urls_from_rows(_csv_rows(sheet)))
+            else:
+                urls.append(c)
+
     urls = list(dict.fromkeys(u.strip() for u in urls if u.strip()))[:MAX_URLS]
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_map = {executor.submit(scrape_url, u): u for u in urls}
-        for future in as_completed(future_map):
-            try:
-                result = future.result()
-                if result:
-                    results.append(result)
-            except Exception:
-                pass
-    return results
+    return urls, None
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
+# ── Routes ─────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -185,67 +220,110 @@ def index():
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
-    urls: list[str] = []
-
-    # ── File upload path ─────────────────────────────────────────
-    if "file" in request.files:
-        f = request.files["file"]
-        filename = f.filename.lower() if f.filename else ""
-        data = f.read()
-        try:
-            if filename.endswith(".csv"):
-                rows = _csv_to_rows(data)
-            elif filename.endswith(".xlsx"):
-                rows = _xlsx_to_rows(data)
-            elif filename.endswith(".xls"):
-                rows = _xls_to_rows(data)
-            else:
-                return jsonify({"error": "Unsupported file type. Use CSV or XLS/XLSX."}), 400
-            urls = _extract_urls_from_rows(rows)
-        except Exception as exc:
-            return jsonify({"error": f"Could not parse file: {exc}"}), 400
-
-    # ── Text / JSON body path ────────────────────────────────────
-    else:
-        body = request.get_json(silent=True) or {}
-        raw_text = body.get("urls", "") or request.form.get("urls", "")
-
-        candidates = [u.strip() for u in re.split(r"[,\n\r]+", raw_text) if u.strip()]
-
-        for c in candidates:
-            if _is_gsheet_url(c):
-                # Fetch the Google Sheet and extract URLs from the website column
-                sheet_csv = _fetch_gsheet_as_csv(c)
-                if sheet_csv is None:
-                    return jsonify({
-                        "error": "Could not download the Google Sheet. "
-                                 "Make sure it's shared as 'Anyone with the link can view'."
-                    }), 400
-                try:
-                    rows = _csv_to_rows(sheet_csv)
-                    urls.extend(_extract_urls_from_rows(rows))
-                except Exception as exc:
-                    return jsonify({"error": f"Could not parse Google Sheet: {exc}"}), 400
-            else:
-                urls.append(c)
-
+    """Synchronous scrape — used when SSE isn't available (older clients)."""
+    urls, err = _collect_urls(request)
+    if err:
+        return jsonify({"error": err}), 400
     if not urls:
         return jsonify({"error": "No website URLs found in your input."}), 400
 
-    results = _scrape_all(urls)
-    return jsonify({"results": results, "count": len(results), "scanned": len(urls)})
+    results, failed = [], []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(_throttled_scrape, u): u for u in urls}
+        for f in as_completed(futs):
+            u = futs[f]
+            try:
+                r = f.result()
+                if r:
+                    results.append(r)
+                else:
+                    failed.append(u)
+            except Exception as exc:
+                log.warning("scrape error for %s: %s", u, exc)
+                failed.append(u)
+
+    return jsonify(
+        {"results": results, "failed": failed,
+         "count": len(results), "scanned": len(urls)}
+    )
+
+
+@app.route("/scrape-stream", methods=["POST"])
+def scrape_stream():
+    """Stream live progress via Server-Sent Events."""
+    urls, err = _collect_urls(request)
+    if err:
+        return jsonify({"error": err}), 400
+    if not urls:
+        return jsonify({"error": "No website URLs found in your input."}), 400
+
+    def gen():
+        yield f"data: {json.dumps({'event':'start','total':len(urls)})}\n\n"
+        results, failed = [], []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = {ex.submit(_throttled_scrape, u): u for u in urls}
+            done = 0
+            for f in as_completed(futs):
+                u = futs[f]
+                done += 1
+                try:
+                    r = f.result()
+                except Exception as exc:
+                    log.warning("stream scrape error for %s: %s", u, exc)
+                    r = None
+                if r:
+                    results.append(r)
+                    payload = {"event": "row", "result": r, "done": done, "total": len(urls)}
+                else:
+                    failed.append(u)
+                    payload = {"event": "failed", "url": u, "done": done, "total": len(urls)}
+                yield f"data: {json.dumps(payload)}\n\n"
+        yield f"data: {json.dumps({'event':'end','count':len(results),'failed_count':len(failed),'scanned':len(urls),'failed':failed})}\n\n"
+
+    return Response(
+        stream_with_context(gen()),
+        mimetype="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 @app.route("/export", methods=["POST"])
 def export():
     body = request.get_json(silent=True) or {}
     rows = body.get("results", [])
+    fmt  = (body.get("format") or "csv").lower()
+    fieldnames = ["url", "emails", "phones", "socials", "city"]
 
+    # Normalize each row to have all fields
+    for r in rows:
+        for f in fieldnames:
+            r.setdefault(f, "")
+
+    if fmt == "xlsx":
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Results"
+        ws.append([f.capitalize() for f in fieldnames])
+        for r in rows:
+            ws.append([r.get(f, "") for f in fieldnames])
+        # Auto-width columns
+        for col_idx, f in enumerate(fieldnames, start=1):
+            longest = max([len(str(r.get(f, ""))) for r in rows] + [len(f)])
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(longest + 2, 60)
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return Response(
+            buf.getvalue(),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="results.xlsx"'},
+        )
+
+    # Default: CSV
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["url", "emails", "city"])
-    writer.writeheader()
-    writer.writerows(rows)
-
+    w = csv.DictWriter(buf, fieldnames=fieldnames)
+    w.writeheader()
+    w.writerows(rows)
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
@@ -253,8 +331,18 @@ def export():
     )
 
 
-# ---------------------------------------------------------------------------
+# ── Entry point ────────────────────────────────────────────────────
+def _run_waitress(port: int):
+    """Production server (no dev-warning, handles concurrency properly)."""
+    from waitress import serve
+    log.info("Starting waitress on http://0.0.0.0:%s", port)
+    serve(app, host="0.0.0.0", port=port, threads=16)
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(debug=False, host="0.0.0.0", port=port)
+    try:
+        _run_waitress(port)
+    except ImportError:
+        log.warning("waitress not installed — falling back to Flask dev server")
+        app.run(debug=False, host="0.0.0.0", port=port)

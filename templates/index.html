@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Email & City Scraper</title>
+  <title>Email & Contact Scraper</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css?v=5" />
+  <link rel="stylesheet" href="/static/style.css?v=6" />
 </head>
 <body class="bg-slate-100 min-h-screen">
 
-<!-- ── Hero ──────────────────────────────────────────────────────── -->
+<!-- ══ Hero ═══════════════════════════════════════════════════════ -->
 <header class="bg-gradient-to-br from-blue-700 to-blue-900 text-white px-5 pt-10 pb-8">
   <div class="max-w-4xl mx-auto">
     <div class="flex items-start gap-4 mb-6">
@@ -20,8 +20,8 @@
         </svg>
       </div>
       <div>
-        <h1 class="text-2xl sm:text-3xl font-extrabold tracking-tight">Email &amp; City Scraper</h1>
-        <p class="mt-1 text-blue-200 text-sm max-w-lg">Paste URLs or upload a spreadsheet — extracts emails &amp; city from footer and contact pages automatically.</p>
+        <h1 class="text-2xl sm:text-3xl font-extrabold tracking-tight">Email &amp; Contact Scraper</h1>
+        <p class="mt-1 text-blue-200 text-sm max-w-lg">Pulls emails, phone numbers, social links &amp; city info from any website's footer, contact, or about page.</p>
       </div>
     </div>
     <div class="flex items-center gap-2 flex-wrap text-xs">
@@ -30,23 +30,28 @@
       </span>
       <svg class="w-4 h-4 text-white/30" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>
       <span class="flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-full pl-1.5 pr-3 py-1">
-        <span class="bg-white/25 rounded-full w-5 h-5 flex items-center justify-center font-bold">2</span> Click Scrape
+        <span class="bg-white/25 rounded-full w-5 h-5 flex items-center justify-center font-bold">2</span> Live Scrape
       </span>
       <svg class="w-4 h-4 text-white/30" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>
       <span class="flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-full pl-1.5 pr-3 py-1">
-        <span class="bg-white/25 rounded-full w-5 h-5 flex items-center justify-center font-bold">3</span> Export CSV
+        <span class="bg-white/25 rounded-full w-5 h-5 flex items-center justify-center font-bold">3</span> Export
       </span>
+      <span class="flex-1"></span>
+      <button id="history-btn" type="button" class="flex items-center gap-1.5 bg-white/10 hover:bg-white/20 border border-white/20 rounded-full px-3 py-1 transition">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        History
+      </button>
     </div>
   </div>
 </header>
 
-<!-- ── Main ───────────────────────────────────────────────────────── -->
+<!-- ══ Main ════════════════════════════════════════════════════════ -->
 <main class="max-w-4xl mx-auto px-5 py-6 space-y-4">
 
-  <!-- Input card -->
+  <!-- ── Input card ──────────────────────────────────────────── -->
   <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
 
-    <!-- Tabs (inline onclick — no script dependency) -->
+    <!-- Tabs -->
     <div class="flex bg-gray-50 border-b border-slate-200 px-2 pt-2 gap-1">
       <button id="tab-text" type="button" class="tab active flex items-center gap-1.5 px-4 py-2.5 text-sm rounded-t-lg transition-all"
         onclick="document.getElementById('panel-text').style.display='block';document.getElementById('panel-file').style.display='none';document.getElementById('tab-text').classList.add('active');document.getElementById('tab-file').classList.remove('active');">
@@ -60,28 +65,25 @@
       </button>
     </div>
 
-    <!-- Panel: Paste URLs -->
+    <!-- Paste URLs panel -->
     <div id="panel-text" class="panel active p-5">
       <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
         Paste website URLs — or a Google Sheet link
       </label>
-
-      <!-- Google Sheets info banner -->
       <div class="flex items-start gap-2 mb-2 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 text-xs text-emerald-800">
         <svg class="w-4 h-4 flex-shrink-0 mt-0.5 text-emerald-600" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" d="M9 17v-2a4 4 0 014-4h6m0 0l-3-3m3 3l-3 3M5 7h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V9a2 2 0 012-2z"/>
         </svg>
         <span>
-          <strong>Tip:</strong> You can also paste a <strong>Google Sheet URL</strong> here — the app will find the
+          <strong>Tip:</strong> Paste a <strong>Google Sheet URL</strong> here — the app will find the
           <code class="bg-emerald-100 px-1 rounded">Website</code> column and scrape every URL in it.
-          <em class="text-emerald-700">Sheet must be set to "Anyone with the link can view".</em>
+          Sheet must be set to "Anyone with the link can view".
         </span>
       </div>
-
       <div class="relative">
         <textarea id="url-input" rows="7" spellcheck="false"
           class="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-mono text-gray-800 focus:outline-none focus:border-blue-500 focus:bg-white focus:ring-2 focus:ring-blue-100 resize-y transition leading-relaxed"
-          placeholder="Examples:&#10;&#10;https://example.com&#10;businesssite.com, anothersite.co.uk&#10;&#10;Or a Google Sheet link:&#10;https://docs.google.com/spreadsheets/d/...&#10;(must have a column named Website / URL / Site)"></textarea>
+          placeholder="Examples:&#10;&#10;https://example.com&#10;businesssite.com, anothersite.co.uk&#10;&#10;Or a Google Sheet link:&#10;https://docs.google.com/spreadsheets/d/..."></textarea>
         <span id="url-count" class="absolute bottom-2.5 right-3 text-[11px] text-gray-400 pointer-events-none">0 URLs</span>
       </div>
       <div class="flex items-center justify-between mt-3">
@@ -96,13 +98,11 @@
       </div>
     </div>
 
-    <!-- Panel: Upload File -->
+    <!-- Upload File panel -->
     <div id="panel-file" class="panel p-5">
       <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">
         Upload a spreadsheet containing URLs
       </label>
-
-      <!-- Drop zone (no inline onclick) -->
       <div id="drop-zone" class="border-2 border-dashed border-slate-300 rounded-2xl p-10 text-center cursor-pointer bg-slate-50 hover:border-blue-400 hover:bg-blue-50 transition-all group">
         <input type="file" id="file-input" accept=".csv,.xls,.xlsx" style="display:none" />
         <div class="text-slate-300 group-hover:text-blue-400 transition mb-3 flex justify-center">
@@ -118,8 +118,6 @@
           <span class="bg-slate-200 text-slate-500 text-[10px] font-bold tracking-widest px-2 py-1 rounded">.XLSX</span>
         </div>
       </div>
-
-      <!-- File preview (hidden until file picked) -->
       <div id="file-preview" style="display:none" class="mt-3 flex items-center gap-3 bg-blue-50 border border-blue-200 rounded-xl px-4 py-3">
         <svg class="w-5 h-5 text-blue-500 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
         <span id="file-name-text" class="flex-1 text-sm font-medium text-blue-800 truncate"></span>
@@ -127,7 +125,6 @@
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
         </button>
       </div>
-
       <div class="flex justify-end mt-3">
         <button id="scrape-file-btn" disabled class="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold px-5 py-2.5 rounded-xl transition shadow-sm">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path stroke-linecap="round" d="M21 21l-4.35-4.35"/></svg>
@@ -137,27 +134,33 @@
     </div>
   </div>
 
-  <!-- Progress -->
+  <!-- ── Live progress card ────────────────────────────────────── -->
   <div id="progress-card" style="display:none" class="bg-white rounded-2xl shadow-sm border border-blue-100 p-5">
-    <div class="flex items-center gap-4 mb-4">
+    <div class="flex items-center gap-4 mb-3">
       <div class="w-10 h-10 rounded-full border-4 border-blue-100 border-t-blue-600 spin flex-shrink-0"></div>
-      <div>
+      <div class="flex-1">
         <p id="progress-title" class="font-bold text-gray-800 text-sm">Scraping in progress…</p>
-        <p class="text-xs text-gray-400 mt-0.5">Checking homepage footer &amp; contact page for each URL</p>
+        <p id="progress-sub" class="text-xs text-gray-400 mt-0.5">Starting…</p>
       </div>
+      <button id="cancel-btn" class="flex items-center gap-1 text-xs text-red-500 hover:text-red-700 hover:bg-red-50 px-2 py-1 rounded-lg transition">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12"/></svg>
+        Cancel
+      </button>
     </div>
-    <div class="bg-slate-100 rounded-full h-1.5 overflow-hidden">
-      <div class="bar-anim h-full bg-gradient-to-r from-blue-500 to-blue-400 rounded-full"></div>
+    <div class="bg-slate-100 rounded-full h-2 overflow-hidden">
+      <div id="progress-fill" class="h-full bg-gradient-to-r from-blue-500 to-blue-400 rounded-full transition-all" style="width:0%"></div>
     </div>
+    <!-- Live ticker of URLs as they complete -->
+    <div id="live-ticker" class="mt-3 flex flex-col gap-1 max-h-32 overflow-y-auto text-xs"></div>
   </div>
 
-  <!-- Error -->
+  <!-- ── Error ────────────────────────────────────────────────── -->
   <div id="error-box" style="display:none" class="bg-red-50 border border-red-200 rounded-2xl px-4 py-3.5 flex items-start gap-3">
     <svg class="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
     <span id="error-msg" class="text-sm text-red-700"></span>
   </div>
 
-  <!-- Results -->
+  <!-- ── Results ──────────────────────────────────────────────── -->
   <div id="results-section" style="display:none" class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
 
     <!-- Stats bar -->
@@ -173,21 +176,35 @@
       </div>
       <div class="w-px h-9 bg-slate-200"></div>
       <div class="text-center min-w-[70px]">
+        <div id="stat-phones" class="text-2xl font-extrabold text-amber-600">0</div>
+        <div class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 mt-0.5">Phones</div>
+      </div>
+      <div class="w-px h-9 bg-slate-200"></div>
+      <div class="text-center min-w-[70px]">
         <div id="stat-cities" class="text-2xl font-extrabold text-violet-600">0</div>
         <div class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 mt-0.5">Cities</div>
       </div>
       <div class="flex-1"></div>
-      <button id="export-btn" class="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-4 py-2.5 rounded-xl transition">
-        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
-        Export CSV
+      <button id="copy-all-btn" class="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold px-3 py-2 rounded-xl transition">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        Copy emails
       </button>
+      <div class="flex">
+        <button id="export-csv-btn" class="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-3 py-2 rounded-l-xl transition">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+          CSV
+        </button>
+        <button id="export-xlsx-btn" class="flex items-center gap-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold px-3 py-2 rounded-r-xl transition border-l border-emerald-800">
+          Excel
+        </button>
+      </div>
     </div>
 
-    <!-- Filter -->
-    <div class="border-b border-slate-100 px-4 py-3 flex items-center gap-3">
+    <!-- Filter row -->
+    <div class="border-b border-slate-100 px-4 py-3 flex items-center gap-3 flex-wrap">
       <div class="flex items-center gap-2 flex-1 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus-within:border-blue-400 focus-within:bg-white transition">
         <svg class="w-3.5 h-3.5 text-gray-400 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path stroke-linecap="round" d="M21 21l-4.35-4.35"/></svg>
-        <input id="filter-input" type="text" placeholder="Filter by URL, email or city…"
+        <input id="filter-input" type="text" placeholder="Filter by any field…"
           class="flex-1 bg-transparent text-sm text-gray-700 outline-none placeholder-gray-400" />
       </div>
       <span id="showing-label" class="text-xs text-gray-400 whitespace-nowrap"></span>
@@ -199,9 +216,11 @@
         <thead>
           <tr class="bg-slate-50 border-b border-slate-200">
             <th class="text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3 w-10">#</th>
-            <th class="text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3 w-1/4">Website</th>
-            <th class="text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3">Email Address(es)</th>
-            <th class="text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3 w-1/5">City</th>
+            <th data-sort="url"     class="sortable text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3 cursor-pointer">Website</th>
+            <th data-sort="emails"  class="sortable text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3">Email(s)</th>
+            <th data-sort="phones"  class="sortable text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3">Phone(s)</th>
+            <th data-sort="socials" class="sortable text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3">Social</th>
+            <th data-sort="city"    class="sortable text-left text-[11px] font-bold uppercase tracking-wider text-gray-400 px-4 py-3">City</th>
           </tr>
         </thead>
         <tbody id="results-body"></tbody>
@@ -210,16 +229,42 @@
     </div>
   </div>
 
+  <!-- ── Failed URLs ──────────────────────────────────────────── -->
+  <div id="failed-section" style="display:none" class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+    <div class="bg-amber-50 border-b border-amber-200 px-5 py-3 flex items-center gap-2">
+      <svg class="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+      <h3 class="font-semibold text-sm text-amber-900 flex-1">Skipped — no email found <span id="failed-count" class="text-xs text-amber-700 font-normal">(0)</span></h3>
+      <button id="toggle-failed-btn" class="text-xs text-amber-700 hover:text-amber-900 font-semibold">Show</button>
+    </div>
+    <div id="failed-body" style="display:none" class="px-5 py-3 max-h-60 overflow-y-auto"></div>
+  </div>
+
+  <!-- ── History modal ────────────────────────────────────────── -->
+  <div id="history-modal" style="display:none" class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-lg max-w-lg w-full max-h-[80vh] overflow-hidden flex flex-col">
+      <div class="border-b border-slate-200 px-5 py-3 flex items-center justify-between">
+        <h3 class="font-bold text-gray-800">Recent scrapes</h3>
+        <button id="close-history-btn" class="text-gray-400 hover:text-gray-700">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div id="history-list" class="overflow-y-auto p-3 space-y-2"></div>
+      <div class="border-t border-slate-200 px-5 py-2 text-right">
+        <button id="clear-history-btn" class="text-xs text-red-500 hover:text-red-700 transition">Clear history</button>
+      </div>
+    </div>
+  </div>
+
 </main>
 
 <footer class="text-center py-5 text-xs text-gray-400 border-t border-slate-200 bg-white mt-4">
-  Scrapes homepage footer + contact page only — fast &amp; respectful to target sites.
+  Scrapes homepage, contact &amp; about pages only — respects per-domain rate limits.
 </footer>
 
 <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 bg-gray-900 text-white text-xs font-semibold px-5 py-2.5 rounded-full shadow-lg pointer-events-none opacity-0 z-50 transition-opacity duration-200">
-  Copied to clipboard!
+  Copied!
 </div>
 
-<script src="/static/script.js?v=4"></script>
+<script src="/static/script.js?v=6"></script>
 </body>
 </html>

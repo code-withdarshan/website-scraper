@@ -1,6 +1,9 @@
-flask==3.0.3
-requests==2.32.3
-beautifulsoup4==4.12.3
-openpyxl==3.1.5
-xlrd==2.0.1
-urllib3==2.2.2
+flask>=3.0
+waitress>=3.0
+streamlit>=1.38
+pandas>=2.2
+requests>=2.31
+beautifulsoup4>=4.12
+openpyxl>=3.1
+xlrd>=2.0
+urllib3>=2.0

@@ -218,6 +218,18 @@ def _format_phone(raw: str) -> str:
     return digits
 
 
+def _dedup_phones(phones: set[str]) -> list[str]:
+    """Collapse phones that share the same trailing 10 digits, prefer + form."""
+    by_key: dict[str, str] = {}
+    for p in phones:
+        digits = re.sub(r"\D", "", p)
+        key = digits[-10:] if len(digits) >= 10 else digits
+        existing = by_key.get(key)
+        if existing is None or (p.startswith("+") and not existing.startswith("+")):
+            by_key[key] = p
+    return sorted(by_key.values())
+
+
 # ── Social links ────────────────────────────────────────────────────
 def _socials_from_soup(soup: BeautifulSoup, raw_html: str) -> dict[str, str]:
     out: dict[str, str] = {}
@@ -360,7 +372,7 @@ def scrape_url(url: str) -> dict | None:
     return {
         "url":     display_url,
         "emails":  ", ".join(sorted(clean_emails)),
-        "phones":  ", ".join(sorted(phones)) if phones else "",
+        "phones":  ", ".join(_dedup_phones(phones)) if phones else "",
         "socials": ", ".join(f"{k}: {v}" for k, v in sorted(socials.items())),
         "city":    city,
     }
