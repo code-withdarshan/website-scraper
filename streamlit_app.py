@@ -308,6 +308,17 @@ def _estimate_time(unique_urls: list[str]) -> tuple[int, int]:
     return int(est), len(domains_count)
 
 
+# ── Sidebar filter (defined early so it's available before scrape logic) ──
+st.sidebar.markdown("### ⚙️ Filters")
+skip_noncommercial = st.sidebar.checkbox(
+    "Skip non-commercial domains",
+    value=True,
+    help="When ON, .gov / .edu / .ac / .org (and country variants like .gov.uk, "
+         ".edu.au) are filtered out before scraping. Turn OFF to scrape them too.",
+)
+st.sidebar.markdown("---")
+
+
 # ── Hero ───────────────────────────────────────────────────────────
 st.markdown(
     """
@@ -605,16 +616,6 @@ if failed:
 
 # ── Sidebar: history ───────────────────────────────────────────────
 with st.sidebar:
-    # ── Filters ─────────────────────────────────────────────────
-    st.markdown("### ⚙️ Filters")
-    skip_noncommercial = st.checkbox(
-        "Skip non-commercial domains",
-        value=True,
-        help="When ON, .gov / .edu / .ac / .org (and country variants like .gov.uk, "
-             ".edu.au) are filtered out before scraping. Turn OFF to scrape them too.",
-    )
-    st.markdown("---")
-
     # ── Public usage counter ─────────────────────────────────────
     total = _get_counter()
     if total is not None:
