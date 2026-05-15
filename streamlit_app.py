@@ -159,7 +159,8 @@ def _fetch_gsheet_csv(url: str) -> bytes | None:
 
 
 def _collect_urls(text_input: str, uploaded_file) -> tuple[list[str], str | None]:
-    urls = []
+    """Returns raw URL list (NOT deduped, NOT capped) so caller can report dupes."""
+    urls: list[str] = []
     if uploaded_file is not None:
         fn = uploaded_file.name.lower()
         data = uploaded_file.read()
@@ -184,8 +185,35 @@ def _collect_urls(text_input: str, uploaded_file) -> tuple[list[str], str | None
                 urls.extend(_extract_urls_from_rows(_csv_rows(sheet)))
             else:
                 urls.append(c)
-    urls = list(dict.fromkeys(u.strip() for u in urls if u.strip()))[:MAX_URLS]
+    urls = [u.strip() for u in urls if u.strip()]
     return urls, None
+
+
+def _normalize_url(u: str) -> str:
+    """Lowercase host, drop trailing slash & www, for accurate duplicate detection."""
+    parsed = urlparse(u if "://" in u else "https://" + u)
+    host = (parsed.netloc or u).lower().lstrip("www.")
+    return host.rstrip("/")
+
+
+def _estimate_time(unique_urls: list[str]) -> tuple[int, int]:
+    """
+    Rough wall-clock estimate in seconds + unique domain count.
+    Assumes ~4s per URL, MAX_WORKERS in parallel, throttled to 1 req/sec per domain.
+    """
+    if not unique_urls:
+        return 0, 0
+    domains_count: dict[str, int] = {}
+    for u in unique_urls:
+        d = _normalize_url(u)
+        domains_count[d] = domains_count.get(d, 0) + 1
+    max_per_domain = max(domains_count.values())
+    n = len(unique_urls)
+    # Two bounding factors:
+    #   a) worker capacity: n / MAX_WORKERS * 4s per URL
+    #   b) per-domain serial scheduling: max_per_domain * 4s
+    est = max(n / MAX_WORKERS * 4, max_per_domain * 4, 3)
+    return int(est), len(domains_count)
 
 
 # ── Hero ───────────────────────────────────────────────────────────
@@ -241,12 +269,43 @@ with col_a:
 
 # ── Scrape ─────────────────────────────────────────────────────────
 if scrape_clicked:
-    urls, err = _collect_urls(text_input, uploaded_file)
+    raw_urls, err = _collect_urls(text_input, uploaded_file)
     if err:
         st.error(err)
-    elif not urls:
+    elif not raw_urls:
         st.error("No URLs detected in your input.")
     else:
+        # ── Dedup + cap ──────────────────────────────────────────
+        # Normalize for dedup (treat www / non-www / trailing slash as same)
+        seen: dict[str, str] = {}
+        for u in raw_urls:
+            key = _normalize_url(u)
+            seen.setdefault(key, u)
+        urls = list(seen.values())
+
+        dupes = len(raw_urls) - len(urls)
+        capped = max(0, len(urls) - MAX_URLS)
+        if capped:
+            urls = urls[:MAX_URLS]
+
+        # ── Pre-flight info banners ─────────────────────────────
+        info_cols = st.columns(3 if (dupes or capped) else 2)
+        with info_cols[0]:
+            st.info(f"📋 **{len(urls)}** unique URL{'s' if len(urls) != 1 else ''} to scrape")
+        secs, domains = _estimate_time(urls)
+        with info_cols[1]:
+            mins = secs // 60
+            time_str = f"~{mins}m {secs % 60}s" if mins else f"~{secs}s"
+            st.info(f"⏱️ Estimated time: **{time_str}** across {domains} domain{'s' if domains != 1 else ''}")
+        if dupes or capped:
+            with info_cols[2]:
+                msgs = []
+                if dupes:
+                    msgs.append(f"**{dupes}** duplicate{'s' if dupes != 1 else ''} removed")
+                if capped:
+                    msgs.append(f"**{capped}** truncated (max {MAX_URLS})")
+                st.warning("ℹ️ " + " · ".join(msgs))
+
         results, failed = [], []
         progress = st.progress(0.0, text=f"Scraping 0 / {len(urls)}…")
         ticker = st.empty()
@@ -393,8 +452,21 @@ with st.sidebar:
             st.rerun()
 
     st.markdown("---")
-    st.caption(
-        "Scrapes homepage, contact &amp; about pages only — "
-        "respects per-domain rate limits.",
+    st.markdown(
+        """
+        <div style="font-size:.78rem; color:#64748b; line-height:1.5;">
+          <div style="margin-bottom:.4rem;">
+            🤖 <b>Respects robots.txt</b> — URLs disallowed by a site's
+            <code>robots.txt</code> are silently skipped.
+          </div>
+          <div style="margin-bottom:.4rem;">
+            🐢 <b>Per-domain rate limited</b> — 1 request/second per domain.
+          </div>
+          <div>
+            📄 Only scrapes <b>homepage</b>, <b>contact</b>, and <b>about</b> pages —
+            never crawls deeper.
+          </div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )

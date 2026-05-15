@@ -17,9 +17,11 @@ import json
 import logging
 import re
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
@@ -110,6 +112,44 @@ def _is_junk_email(email: str) -> bool:
     return False
 
 
+# ── robots.txt cache (one parser per domain, fetched once) ─────────
+_robots_cache: dict[str, RobotFileParser | None] = {}
+_robots_lock = threading.Lock()
+
+
+def _allowed_by_robots(url: str) -> bool:
+    """Return True if robots.txt allows fetching this URL with our UA."""
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return True
+    domain_root = f"{parsed.scheme}://{parsed.netloc}"
+
+    with _robots_lock:
+        if domain_root not in _robots_cache:
+            rp = RobotFileParser()
+            rp.set_url(f"{domain_root}/robots.txt")
+            try:
+                resp = requests.get(
+                    f"{domain_root}/robots.txt",
+                    headers=HEADERS, timeout=5, allow_redirects=True,
+                )
+                if resp.status_code == 200 and resp.text:
+                    rp.parse(resp.text.splitlines())
+                    _robots_cache[domain_root] = rp
+                else:
+                    _robots_cache[domain_root] = None  # no robots.txt = allow
+            except Exception:
+                _robots_cache[domain_root] = None
+        rp = _robots_cache[domain_root]
+
+    if rp is None:
+        return True
+    try:
+        return rp.can_fetch(HEADERS["User-Agent"], url)
+    except Exception:
+        return True
+
+
 def _is_safe_url(url: str) -> bool:
     """SSRF guard — reject internal / loopback / link-local addresses."""
     try:
@@ -134,6 +174,9 @@ def _fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> str | None:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     if not _is_safe_url(url):
+        return None
+    if not _allowed_by_robots(url):
+        log.info("Blocked by robots.txt: %s", url)
         return None
     last_err = None
     for attempt in range(MAX_RETRIES):
