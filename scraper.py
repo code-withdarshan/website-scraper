@@ -1,68 +1,98 @@
+"""
+Scraper — pulls emails, phones, social links, and city info from a website.
+
+Strategy per URL (max 3 HTTP requests):
+  1. Homepage  (always)
+  2. Contact page  (if a link is found on homepage)
+  3. About / Team page  (only if no email found yet)
+
+All extraction prefers structured data (JSON-LD, microdata) over text heuristics
+to avoid false positives.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import logging
 import re
+import socket
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import unquote, urljoin, urlparse
+
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, unquote
-import logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
+# ── Networking ──────────────────────────────────────────────────────
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
 }
+DEFAULT_TIMEOUT = 12
+MAX_RETRIES = 2
 
-EMAIL_RE = re.compile(
-    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE
+# ── Patterns ────────────────────────────────────────────────────────
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.I)
+
+# International phone formats — quite permissive, scored later
+PHONE_RE = re.compile(
+    r"(?:(?<![\w@.+])"
+    r"(?:\+?\d{1,3}[\s.\-]?)?"          # country code
+    r"(?:\(?\d{2,4}\)?[\s.\-]?)?"        # area code
+    r"\d{3,4}[\s.\-]?\d{3,4}"            # number
+    r"(?:[\s.\-]?\d{2,4})?"              # optional extension
+    r")"
 )
 
+SOCIAL_DOMAINS = {
+    "linkedin":  re.compile(r"https?://(?:[a-z0-9.-]+\.)?linkedin\.com/[^\s\"'<>]+", re.I),
+    "twitter":   re.compile(r"https?://(?:[a-z0-9.-]+\.)?(?:twitter|x)\.com/[^\s\"'<>]+", re.I),
+    "facebook":  re.compile(r"https?://(?:[a-z0-9.-]+\.)?facebook\.com/[^\s\"'<>]+", re.I),
+    "instagram": re.compile(r"https?://(?:[a-z0-9.-]+\.)?instagram\.com/[^\s\"'<>]+", re.I),
+    "youtube":   re.compile(r"https?://(?:[a-z0-9.-]+\.)?youtube\.com/[^\s\"'<>]+", re.I),
+}
+
+CONTACT_LINK_RE = re.compile(
+    r"contact|contact[-_]?us|get[-_]?in[-_]?touch|reach[-_]?us|kontakt", re.I
+)
+ABOUT_LINK_RE = re.compile(r"about|about[-_]?us|team|company|who[-_]?we[-_]?are", re.I)
+
+# Junk-email filters
 JUNK_EMAIL_DOMAINS = {
     "example.com", "domain.com", "yourdomain.com", "email.com",
     "test.com", "placeholder.com", "wix.com", "wixpress.com",
     "squarespace.com", "wordpress.com",
 }
-
-# Any email whose domain ends with one of these suffixes is junk
 JUNK_DOMAIN_SUFFIXES = (
-    ".sentry.io", "sentry.io",
-    ".wixpress.com", "wixpress.com",
-    ".amazonaws.com",
-    ".cloudfront.net",
-    ".sendgrid.net",
-    ".mailchimp.com",
-    ".klaviyo.com",
-    ".hubspot.com",
+    "sentry.io", "wixpress.com", "amazonaws.com", "cloudfront.net",
+    "sendgrid.net", "mailchimp.com", "klaviyo.com", "hubspot.com",
 )
 
-# Link text / href patterns that indicate a contact page
-CONTACT_LINK_RE = re.compile(
-    r"contact|contact[-_]?us|get[-_]?in[-_]?touch|reach[-_]?us|kontakt",
-    re.IGNORECASE,
-)
-
-JSONLD_CITY_RE = re.compile(
-    r'"addressLocality"\s*:\s*"([^"]{2,50})"', re.IGNORECASE
-)
-META_GEO_RE = re.compile(r'geo\.placename', re.IGNORECASE)
-CITY_LABEL_RE = re.compile(
-    r"(?:city|location|address|based in|serving|headquartered)[:\s]+([A-Z][a-zA-Z\s]{2,30})",
-    re.IGNORECASE,
-)
+# Junk-phone filters (years, version numbers, postal codes that match the regex)
+def _is_junk_phone(p: str) -> bool:
+    digits = re.sub(r"\D", "", p)
+    if len(digits) < 7 or len(digits) > 15:
+        return True
+    # Likely a year
+    if re.fullmatch(r"(19|20)\d{2}", digits):
+        return True
+    # All zeros or repeated digit
+    if len(set(digits)) == 1:
+        return True
+    return False
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
+# ── Helpers ─────────────────────────────────────────────────────────
 def _clean_email(raw: str) -> str:
-    """URL-decode, strip whitespace/punctuation noise from an email candidate."""
     return unquote(raw).strip().strip(".,;\"'<>()[]").lower()
 
 
@@ -70,175 +100,267 @@ def _is_junk_email(email: str) -> bool:
     domain = email.split("@")[-1].lower()
     if domain in JUNK_EMAIL_DOMAINS:
         return True
-    if any(domain == s.lstrip(".") or domain.endswith(s) for s in JUNK_DOMAIN_SUFFIXES):
+    if any(domain == s or domain.endswith("." + s) for s in JUNK_DOMAIN_SUFFIXES):
         return True
-    # Skip image/asset filenames mistaken for emails
     if re.search(r"\.(png|jpg|jpeg|gif|svg|webp|css|js|woff|ttf|eot)$", domain):
         return True
-    # Skip hex-only local parts (tracking IDs like Sentry DSNs)
     local = email.split("@")[0]
     if re.fullmatch(r"[0-9a-f]{20,}", local):
         return True
     return False
 
 
-def _fetch(url: str, timeout: int = 12) -> str | None:
+def _is_safe_url(url: str) -> bool:
+    """SSRF guard — reject internal / loopback / link-local addresses."""
+    try:
+        host = urlparse(url).hostname
+        if not host:
+            return False
+        # Don't allow direct IP targeting unless it's clearly public
+        try:
+            addrs = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            return False
+        for a in addrs:
+            ip = ipaddress.ip_address(a[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> str | None:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-        resp.raise_for_status()
-        return resp.text
-    except Exception as exc:
-        logger.debug("Fetch failed for %s: %s", url, exc)
+    if not _is_safe_url(url):
         return None
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            resp.raise_for_status()
+            # Skip non-HTML responses
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if ctype and "html" not in ctype and "xml" not in ctype:
+                return None
+            return resp.text
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_err = exc
+            time.sleep(0.5 * (attempt + 1))
+        except Exception as exc:
+            last_err = exc
+            break
+    log.debug("Fetch failed %s: %s", url, last_err)
+    return None
 
 
+# ── Email extraction ────────────────────────────────────────────────
 def _add_email(emails: set, raw: str) -> None:
-    """Clean and add one email candidate to the set, discarding invalid ones."""
     cleaned = _clean_email(raw)
     if EMAIL_RE.match(cleaned):
         emails.add(cleaned)
 
 
-def _emails_from_footer(soup: BeautifulSoup, raw_html: str) -> set[str]:
+def _emails_from_soup(soup: BeautifulSoup, raw_html: str = "") -> set[str]:
     emails: set[str] = set()
-
-    footer = soup.find("footer")
-    if not footer:
-        footer = (
-            soup.find(attrs={"role": "contentinfo"})
-            or soup.find(id=re.compile(r"footer", re.I))
-            or soup.find(class_=re.compile(r"footer", re.I))
-        )
-
-    target = footer if footer else soup
-
-    for tag in target.find_all("a", href=True):
-        href = tag["href"]
-        if href.lower().startswith("mailto:"):
-            _add_email(emails, href[7:].split("?")[0])
-
-    for match in EMAIL_RE.finditer(target.get_text(" ")):
-        _add_email(emails, match.group())
-
+    for tag in soup.find_all("a", href=True):
+        if tag["href"].lower().startswith("mailto:"):
+            _add_email(emails, tag["href"][7:].split("?")[0])
+    for m in EMAIL_RE.finditer(soup.get_text(" ")):
+        _add_email(emails, m.group())
+    if raw_html:
+        for m in EMAIL_RE.finditer(raw_html):
+            _add_email(emails, m.group())
     return emails
 
 
-def _emails_from_soup(soup: BeautifulSoup) -> set[str]:
-    emails: set[str] = set()
+# ── Phone extraction ────────────────────────────────────────────────
+def _phones_from_soup(soup: BeautifulSoup) -> set[str]:
+    phones: set[str] = set()
+
+    # 1. tel: links (most reliable)
     for tag in soup.find_all("a", href=True):
-        href = tag["href"]
-        if href.lower().startswith("mailto:"):
-            _add_email(emails, href[7:].split("?")[0])
-    for match in EMAIL_RE.finditer(soup.get_text(" ")):
-        _add_email(emails, match.group())
-    return emails
+        if tag["href"].lower().startswith("tel:"):
+            num = tag["href"][4:].split("?")[0].strip()
+            num = re.sub(r"[^\d+]", "", num)
+            if num and not _is_junk_phone(num):
+                phones.add(_format_phone(num))
+
+    # 2. Structured data
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "{}")
+        except Exception:
+            continue
+        for tel in _walk_jsonld(data, "telephone"):
+            num = re.sub(r"[^\d+]", "", str(tel))
+            if num and not _is_junk_phone(num):
+                phones.add(_format_phone(num))
+
+    # 3. Heuristic regex (only in obvious "contact" sections to limit noise)
+    contact_regions = soup.find_all(
+        ["footer", "address"]
+    ) + soup.find_all(class_=re.compile(r"contact|phone|footer", re.I))
+    for region in contact_regions:
+        for m in PHONE_RE.finditer(region.get_text(" ")):
+            raw = m.group().strip()
+            if raw and not _is_junk_phone(raw):
+                phones.add(_format_phone(raw))
+
+    return phones
 
 
-def _find_contact_url(soup: BeautifulSoup, base_url: str) -> str | None:
-    """Return the absolute URL of the contact page, or None."""
-    for tag in soup.find_all("a", href=True):
-        href = tag["href"].strip()
-        text = tag.get_text(strip=True)
-        if CONTACT_LINK_RE.search(href) or CONTACT_LINK_RE.search(text):
-            absolute = urljoin(base_url, href)
-            # Stay on the same domain
-            if urlparse(absolute).netloc == urlparse(base_url).netloc:
-                return absolute
-    return None
+def _format_phone(raw: str) -> str:
+    digits = re.sub(r"\D", "", raw)
+    if raw.startswith("+"):
+        return "+" + digits
+    return digits
+
+
+# ── Social links ────────────────────────────────────────────────────
+def _socials_from_soup(soup: BeautifulSoup, raw_html: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for platform, pattern in SOCIAL_DOMAINS.items():
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"]
+            if pattern.match(href):
+                # Skip share/intent URLs
+                if any(p in href.lower() for p in ("/share", "/intent", "sharer.php")):
+                    continue
+                out.setdefault(platform, href.split("?")[0].rstrip("/"))
+                break
+        if platform not in out:
+            m = pattern.search(raw_html)
+            if m:
+                href = m.group()
+                if not any(p in href.lower() for p in ("/share", "/intent", "sharer.php")):
+                    out[platform] = href.split("?")[0].rstrip("/")
+    return out
+
+
+# ── City extraction (structured-data only, no text-regex false positives) ──
+def _walk_jsonld(node, key):
+    """Yield all values for `key` anywhere inside a (possibly nested) JSON-LD object."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k.lower() == key.lower():
+                yield v
+            yield from _walk_jsonld(v, key)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_jsonld(item, key)
 
 
 def _extract_city(soup: BeautifulSoup, raw_html: str) -> str:
-    # 1. JSON-LD structured data
+    # 1. JSON-LD addressLocality
     for script in soup.find_all("script", type="application/ld+json"):
-        m = JSONLD_CITY_RE.search(script.string or "")
-        if m:
-            return m.group(1).strip()
+        try:
+            data = json.loads(script.string or "{}")
+        except Exception:
+            continue
+        for v in _walk_jsonld(data, "addressLocality"):
+            if isinstance(v, str) and 1 < len(v) < 50:
+                return v.strip()
 
-    # 2. meta geo.placename
-    for meta in soup.find_all("meta"):
-        name = meta.get("name", "") or meta.get("property", "")
-        if META_GEO_RE.search(name):
-            content = meta.get("content", "").strip()
-            if content:
-                return content
-
-    # 3. Microdata addressLocality
+    # 2. Microdata itemprop="addressLocality"
     tag = soup.find(attrs={"itemprop": "addressLocality"})
     if tag:
-        city = (tag.get_text() or tag.get("content", "")).strip()
-        if city:
-            return city
+        text = (tag.get_text() or tag.get("content", "")).strip()
+        if 1 < len(text) < 50:
+            return text
 
-    # 4. Text label patterns
-    text = soup.get_text(" ", strip=True)
-    m = CITY_LABEL_RE.search(text)
-    if m:
-        candidate = m.group(1).strip().rstrip(".,;")
-        if 2 < len(candidate) < 40:
-            return candidate
-
-    # 5. Raw HTML fallback
-    m = JSONLD_CITY_RE.search(raw_html)
-    if m:
-        return m.group(1).strip()
+    # 3. <meta name="geo.placename"> or property="business:contact_data:locality"
+    for meta in soup.find_all("meta"):
+        name = (meta.get("name", "") or meta.get("property", "")).lower()
+        if "placename" in name or "locality" in name:
+            content = (meta.get("content", "") or "").strip()
+            if 1 < len(content) < 50:
+                return content
 
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+# ── Discover sub-pages ──────────────────────────────────────────────
+def _find_subpage(soup: BeautifulSoup, base_url: str, pattern: re.Pattern) -> str | None:
+    base_domain = urlparse(base_url).netloc
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"].strip()
+        text = tag.get_text(strip=True)
+        if pattern.search(href) or pattern.search(text):
+            absolute = urljoin(base_url, href)
+            if urlparse(absolute).netloc == base_domain:
+                return absolute
+    return None
 
+
+# ── Public entry point ─────────────────────────────────────────────
 def scrape_url(url: str) -> dict | None:
+    """
+    Returns a dict if a real email was found, else None.
+    Schema:
+        {
+          "url": "domain.com",
+          "emails":  "a@x.com, b@x.com",
+          "phones":  "+15551234567, +15559876543",
+          "socials": "linkedin: https://..., twitter: https://...",
+          "city":    "San Francisco",
+        }
+    """
     raw = url.strip()
     if not raw:
         return None
-
     base_url = raw if raw.startswith(("http://", "https://")) else "https://" + raw
 
-    # ── Step 1: load the homepage ────────────────────────────────
+    # ── 1. Homepage ─────────────────────────────────────────────
     home_html = _fetch(base_url)
     if home_html is None:
         return None
-
     home_soup = BeautifulSoup(home_html, "html.parser")
 
-    # ── Step 2: emails from the entire homepage ──────────────────
-    # (footer first for prioritisation, then the rest of the page,
-    #  plus a raw-HTML regex sweep to catch obfuscated/encoded emails)
-    emails: set[str] = _emails_from_footer(home_soup, home_html)
-    emails |= _emails_from_soup(home_soup)
-    for m in EMAIL_RE.finditer(home_html):
-        _add_email(emails, m.group())
+    emails  = _emails_from_soup(home_soup, home_html)
+    phones  = _phones_from_soup(home_soup)
+    socials = _socials_from_soup(home_soup, home_html)
+    city    = _extract_city(home_soup, home_html)
 
-    # ── Step 3: city from homepage (JSON-LD / meta / microdata) ──
-    city = _extract_city(home_soup, home_html)
-
-    # ── Step 4: find & fetch the contact page ────────────────────
-    contact_url = _find_contact_url(home_soup, base_url)
+    # ── 2. Contact page ─────────────────────────────────────────
+    contact_url = _find_subpage(home_soup, base_url, CONTACT_LINK_RE)
     if contact_url:
-        contact_html = _fetch(contact_url)
-        if contact_html:
-            contact_soup = BeautifulSoup(contact_html, "html.parser")
-            emails |= _emails_from_soup(contact_soup)
-            for m in EMAIL_RE.finditer(contact_html):
-                _add_email(emails, m.group())
+        c_html = _fetch(contact_url)
+        if c_html:
+            c_soup = BeautifulSoup(c_html, "html.parser")
+            emails  |= _emails_from_soup(c_soup, c_html)
+            phones  |= _phones_from_soup(c_soup)
+            for k, v in _socials_from_soup(c_soup, c_html).items():
+                socials.setdefault(k, v)
             if not city:
-                city = _extract_city(contact_soup, contact_html)
+                city = _extract_city(c_soup, c_html)
 
-    # ── Filter junk ──────────────────────────────────────────────
+    # ── 3. About / Team page (only if no email yet) ──────────────
     clean_emails = [e for e in emails if not _is_junk_email(e)]
+    if not clean_emails:
+        about_url = _find_subpage(home_soup, base_url, ABOUT_LINK_RE)
+        if about_url and about_url != contact_url:
+            a_html = _fetch(about_url)
+            if a_html:
+                a_soup = BeautifulSoup(a_html, "html.parser")
+                emails  |= _emails_from_soup(a_soup, a_html)
+                phones  |= _phones_from_soup(a_soup)
+                for k, v in _socials_from_soup(a_soup, a_html).items():
+                    socials.setdefault(k, v)
+                if not city:
+                    city = _extract_city(a_soup, a_html)
+        clean_emails = [e for e in emails if not _is_junk_email(e)]
 
-    # Skip sites with no email found
+    # ── Final filter — must have at least one real email ─────────
     if not clean_emails:
         return None
 
     display_url = urlparse(base_url).netloc or raw
-
     return {
-        "url": display_url,
-        "emails": ", ".join(sorted(clean_emails)),
-        "city": city,
+        "url":     display_url,
+        "emails":  ", ".join(sorted(clean_emails)),
+        "phones":  ", ".join(sorted(phones)) if phones else "",
+        "socials": ", ".join(f"{k}: {v}" for k, v in sorted(socials.items())),
+        "city":    city,
     }
