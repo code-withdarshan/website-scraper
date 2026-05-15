@@ -433,14 +433,16 @@ if results:
 
     total_companies = sum(1 for r in results if r.get("company"))
     total_forms     = sum(1 for r in results if r.get("contact_form"))
+    total_people    = sum(1 for r in results if r.get("people"))
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
     m1.metric("Sites",     len(results))
     m2.metric("Emails",    total_emails)
     m3.metric("Phones",    total_phones)
     m4.metric("Companies", total_companies)
-    m5.metric("Cities",    total_cities)
-    m6.metric("Has form",  total_forms)
+    m5.metric("Key people", total_people)
+    m6.metric("Cities",    total_cities)
+    m7.metric("Has form",  total_forms)
 
     # Filter
     q = st.text_input("🔎 Filter by URL, email, phone, social, or city", value="", key="filter")
@@ -453,6 +455,7 @@ if results:
     df = df.rename(columns={
         "url":          "Website",
         "company":      "Company",
+        "people":       "Key People",
         "emails":       "Emails",
         "phones":       "Phones",
         "socials":      "Socials",
@@ -460,8 +463,8 @@ if results:
         "language":     "Lang",
         "contact_form": "Has form",
     })
-    preferred = ["Website", "Company", "Emails", "Phones", "City",
-                 "Lang", "Has form", "Socials"]
+    preferred = ["Website", "Company", "Key People", "Emails", "Phones",
+                 "City", "Lang", "Has form", "Socials"]
     df = df[[c for c in preferred if c in df.columns]]
 
     st.dataframe(

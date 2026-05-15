@@ -457,6 +457,162 @@ def _walk_jsonld_objects(node):
             yield from _walk_jsonld_objects(item)
 
 
+# ── Key people extraction (founders / CEO / owner / etc.) ──────────
+# Common executive / leadership titles
+PEOPLE_TITLES = {
+    "founder", "co-founder", "cofounder",
+    "owner", "co-owner",
+    "ceo", "cto", "cfo", "coo", "cmo",
+    "president", "vice president", "vp",
+    "director", "managing director", "executive director",
+    "principal", "partner", "chairman", "chairperson",
+    "head", "lead",
+}
+PEOPLE_TITLES_RE = "(?:" + "|".join(re.escape(t) for t in sorted(PEOPLE_TITLES, key=len, reverse=True)) + ")"
+
+# Person name pattern — 2 to 3 capitalised words, allowing initials and apostrophes
+NAME_RE = r"[A-Z][a-zA-Z'’\-]{1,15}(?:\s+[A-Z]\.?)?\s+[A-Z][a-zA-Z'’\-]{1,20}(?:\s+[A-Z][a-zA-Z'’\-]{1,20})?"
+
+# Patterns: "Founded by John Smith" / "CEO John Smith" / "John Smith, CEO"
+TITLE_THEN_NAME_RE = re.compile(
+    r"\b(?:founded\s+by|founder[:,]?|owner[:,]?|ceo[:,]?|"
+    r"president[:,]?|director[:,]?|principal[:,]?|partner[:,]?|"
+    r"chairman[:,]?|managing\s+director[:,]?)\s+(" + NAME_RE + r")\b",
+    re.IGNORECASE,
+)
+NAME_THEN_TITLE_RE = re.compile(
+    r"\b(" + NAME_RE + r"),?\s+(?:is\s+(?:the|our|a)\s+)?(?:the\s+|our\s+)?(" + PEOPLE_TITLES_RE + r")\b",
+    re.IGNORECASE,
+)
+
+# Junk phrases that match the name pattern but aren't real names
+NAME_BLOCKLIST = {
+    "privacy policy", "terms of", "terms and", "cookie policy", "all rights",
+    "contact us", "about us", "read more", "learn more", "get in",
+    "sign up", "log in", "click here", "find out", "free trial",
+    "our team", "our story", "our company", "our mission", "our values",
+    "subscribe to", "follow us", "view all", "see all", "show more",
+    "lorem ipsum", "all rights reserved",
+}
+
+# Common English words that never appear in real names — used to reject
+# false-positive "names" extracted by the regex (e.g. "Hit Play To", "And CEO").
+NAME_STOPWORDS = {
+    "the","and","or","but","if","of","in","on","at","to","for","with","by","from",
+    "as","is","are","was","were","be","been","being","have","has","had","do","does",
+    "did","will","would","could","should","may","might","must","can","this","that",
+    "these","those","our","your","their","my","his","her","its","who","what","when",
+    "where","why","how","all","any","some","no","not","very","just","only","also",
+    "even","still","more","less","much","many","few","most","several","each","every",
+    "both","here","there","hit","play","click","learn","read","find","get","view",
+    "see","show","contact","about","home","team","story","help","make","build","use",
+    "an","a","he","she","they","we","i","you","it","them","us","email","phone",
+    "thank","thanks","welcome","hello","hi","privacy","terms","cookies","policy",
+    "page","next","prev","previous","back","copyright","reserved","rights",
+}
+
+
+def _is_real_name(s: str) -> bool:
+    """Reject phrases that look like names but aren't."""
+    s = s.strip()
+    if not s:
+        return False
+    low = s.lower()
+    if low in NAME_BLOCKLIST:
+        return False
+    if any(low.startswith(b) or low.endswith(b) for b in NAME_BLOCKLIST):
+        return False
+    words = s.split()
+    if len(words) < 2 or len(words) > 4:
+        return False
+    if any(c.isdigit() for c in s):
+        return False
+    # Reject if ANY word is a common English stopword
+    for w in words:
+        w_low = re.sub(r"[^\w]", "", w).lower()
+        if w_low in NAME_STOPWORDS:
+            return False
+        # First letter must be capitalised in every word (real names)
+        if not w[0].isupper():
+            return False
+    return True
+
+
+def _extract_people(soup: BeautifulSoup) -> list[tuple[str, str]]:
+    """Returns list of (name, title) pairs. Deduplicates by name (lowercased)."""
+    people: dict[str, str] = {}   # lowercased-name -> "Name|Title"
+
+    def _add(name: str, title: str):
+        name = re.sub(r"\s+", " ", name).strip(" ,.;:")
+        if not _is_real_name(name):
+            return
+        title = title.strip(" ,.;:").title() if title else ""
+        key = name.lower()
+        # Prefer entries that have a title
+        if key not in people or (title and "|" in people[key] and not people[key].split("|", 1)[1]):
+            people[key] = f"{name}|{title}"
+
+    # 1. JSON-LD: Organization.founder, .employee, .ceo
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "{}")
+        except Exception:
+            continue
+        for node in _walk_jsonld_objects(data):
+            if not isinstance(node, dict):
+                continue
+            t = node.get("@type")
+            # Direct Person entry with jobTitle
+            if t == "Person" and node.get("name"):
+                _add(str(node["name"]), str(node.get("jobTitle", "") or ""))
+            # Organization.founder, .employee, .ceo refs
+            for role_key in ("founder", "founders", "employee", "ceo", "owner"):
+                for person in _as_list(node.get(role_key)):
+                    if isinstance(person, dict) and person.get("name"):
+                        title = person.get("jobTitle") or role_key.capitalize()
+                        _add(str(person["name"]), str(title))
+                    elif isinstance(person, str):
+                        _add(person, role_key.capitalize())
+
+    # 2. Text patterns — only scan likely sections to limit noise
+    candidate_regions = (
+        soup.find_all(["section", "article", "main"]) +
+        soup.find_all(class_=re.compile(r"team|founder|about|leadership|staff", re.I)) +
+        soup.find_all(id=re.compile(r"team|founder|about|leadership|staff", re.I))
+    )
+    # Fall back to whole page if no candidate sections
+    targets = candidate_regions or [soup]
+
+    for region in targets:
+        text = region.get_text(" ", strip=True)
+        for m in TITLE_THEN_NAME_RE.finditer(text):
+            full = m.group(0)
+            name = m.group(1)
+            # Extract the leading title word from match
+            title_match = re.match(
+                r"(founded\s+by|founder|owner|ceo|president|director|principal|partner|chairman|managing\s+director)",
+                full, re.I,
+            )
+            title = "Founder" if title_match and title_match.group(1).lower().startswith("founded") else (
+                title_match.group(1).title() if title_match else ""
+            )
+            _add(name, title)
+        for m in NAME_THEN_TITLE_RE.finditer(text):
+            _add(m.group(1), m.group(2))
+
+    # Format: "Name (Title)" or just "Name" if no title
+    out = []
+    for entry in people.values():
+        n, t = entry.split("|", 1)
+        out.append(f"{n} ({t})" if t else n)
+    return [(p,) for p in out]   # tuple wrapper for uniform return type
+
+
+def _as_list(v):
+    if v is None: return []
+    return v if isinstance(v, list) else [v]
+
+
 # ── WHOIS company fallback ─────────────────────────────────────────
 _whois_cache: dict[str, str] = {}
 _whois_lock  = threading.Lock()
@@ -559,6 +715,7 @@ def scrape_url(url: str) -> dict | None:
     company       = _extract_company(home_soup)
     language      = _extract_language(home_soup)
     contact_form  = _has_contact_form(home_soup)
+    people        = list(_extract_people(home_soup))
 
     # ── 2. Contact page ─────────────────────────────────────────
     contact_url = _find_subpage(home_soup, base_url, CONTACT_LINK_RE)
@@ -574,10 +731,11 @@ def scrape_url(url: str) -> dict | None:
             if not company: company = _extract_company(c_soup)
             if _has_contact_form(c_soup):
                 contact_form = True
+            people.extend(_extract_people(c_soup))
 
-    # ── 3. About / Team page (only if no email yet) ──────────────
+    # ── 3. About / Team page (if no email yet OR no people yet) ──
     clean_emails = [e for e in emails if not _is_junk_email(e)]
-    if not clean_emails:
+    if not clean_emails or not people:
         about_url = _find_subpage(home_soup, base_url, ABOUT_LINK_RE)
         if about_url and about_url != contact_url:
             a_html = _fetch(about_url)
@@ -589,6 +747,7 @@ def scrape_url(url: str) -> dict | None:
                     socials.setdefault(k, v)
                 if not city:    city    = _extract_city(a_soup, a_html)
                 if not company: company = _extract_company(a_soup)
+                people.extend(_extract_people(a_soup))
         clean_emails = [e for e in emails if not _is_junk_email(e)]
 
     # ── WHOIS fallback if no company name found yet ──────────────
@@ -600,9 +759,21 @@ def scrape_url(url: str) -> dict | None:
     if not clean_emails:
         return None
 
+    # Dedup people: each was wrapped in a 1-tuple ("Name (Title)",)
+    seen_people = []
+    seen_keys: set[str] = set()
+    for p in people:
+        s = p[0] if isinstance(p, tuple) else str(p)
+        key = re.sub(r"\s*\(.*\)\s*$", "", s).lower()  # name part for dedup
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        seen_people.append(s)
+
     return {
         "url":          domain,
         "company":      company,
+        "people":       ", ".join(seen_people[:5]),   # cap at 5 to keep cells readable
         "emails":       ", ".join(sorted(clean_emails)),
         "phones":       ", ".join(_dedup_phones(phones)) if phones else "",
         "socials":      ", ".join(f"{k}: {v}" for k, v in sorted(socials.items())),
