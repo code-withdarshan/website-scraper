@@ -61,9 +61,10 @@ st.markdown(
 
 
 # ── Session state ──────────────────────────────────────────────────
-if "results"  not in st.session_state: st.session_state.results  = []
-if "failed"   not in st.session_state: st.session_state.failed   = []
-if "history"  not in st.session_state: st.session_state.history  = []
+if "results"     not in st.session_state: st.session_state.results     = []
+if "failed"      not in st.session_state: st.session_state.failed      = []
+if "history"     not in st.session_state: st.session_state.history     = []
+if "source_name" not in st.session_state: st.session_state.source_name = None
 
 # ── Constants ──────────────────────────────────────────────────────
 MAX_WORKERS = 8
@@ -143,50 +144,82 @@ def _xls_rows(data: bytes):
     return out
 
 
-def _fetch_gsheet_csv(url: str) -> bytes | None:
+def _fetch_gsheet_csv(url: str) -> tuple[bytes | None, str | None]:
+    """Returns (csv_bytes, sheet_title). Sheet title is read from Content-Disposition."""
     m = GSHEET_RE.search(url)
     if not m:
-        return None
+        return None, None
     sid = m.group(1)
     gid = (GSHEET_GID_RE.search(url) or [None, "0"])[1] if GSHEET_GID_RE.search(url) else "0"
     export_url = f"https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}"
     try:
         r = requests.get(export_url, timeout=20, allow_redirects=True)
         r.raise_for_status()
-        return r.content
+        # Parse filename from Content-Disposition: 'attachment; filename="Sheet Name - Tab.csv"'
+        title = None
+        cd = r.headers.get("Content-Disposition", "")
+        m2 = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
+        if m2:
+            raw = m2.group(1).strip()
+            # URL-decode and strip extension
+            try:
+                from urllib.parse import unquote as _uq
+                raw = _uq(raw)
+            except Exception:
+                pass
+            title = re.sub(r"\.csv$", "", raw, flags=re.I).strip()
+        return r.content, title
     except Exception:
-        return None
+        return None, None
 
 
-def _collect_urls(text_input: str, uploaded_file) -> tuple[list[str], str | None]:
-    """Returns raw URL list (NOT deduped, NOT capped) so caller can report dupes."""
+def _collect_urls(text_input: str, uploaded_file) -> tuple[list[str], str | None, str | None]:
+    """
+    Returns (urls, error, source_name).
+    `source_name` is set when the input was a Google Sheet or uploaded file,
+    so exports can be named after the source.
+    """
     urls: list[str] = []
+    source_name: str | None = None
+
     if uploaded_file is not None:
-        fn = uploaded_file.name.lower()
+        fn = uploaded_file.name
         data = uploaded_file.read()
+        # Strip extension for the source name
+        source_name = re.sub(r"\.(csv|xls|xlsx)$", "", fn, flags=re.I).strip()
+        fn_lower = fn.lower()
         try:
-            if fn.endswith(".csv"):
+            if fn_lower.endswith(".csv"):
                 urls = _extract_urls_from_rows(_csv_rows(data))
-            elif fn.endswith(".xlsx"):
+            elif fn_lower.endswith(".xlsx"):
                 urls = _extract_urls_from_rows(_xlsx_rows(data))
-            elif fn.endswith(".xls"):
+            elif fn_lower.endswith(".xls"):
                 urls = _extract_urls_from_rows(_xls_rows(data))
             else:
-                return [], "Unsupported file type."
+                return [], "Unsupported file type.", None
         except Exception as exc:
-            return [], f"Could not parse file: {exc}"
+            return [], f"Could not parse file: {exc}", None
     if text_input:
         cands = [u.strip() for u in re.split(r"[,\n\r]+", text_input) if u.strip()]
         for c in cands:
             if GSHEET_RE.search(c):
-                sheet = _fetch_gsheet_csv(c)
-                if sheet is None:
-                    return [], "Could not download Google Sheet. Make sure it's 'Anyone with the link can view'."
-                urls.extend(_extract_urls_from_rows(_csv_rows(sheet)))
+                sheet_bytes, title = _fetch_gsheet_csv(c)
+                if sheet_bytes is None:
+                    return [], "Could not download Google Sheet. Make sure it's 'Anyone with the link can view'.", None
+                urls.extend(_extract_urls_from_rows(_csv_rows(sheet_bytes)))
+                if title and not source_name:
+                    source_name = title
             else:
                 urls.append(c)
     urls = [u.strip() for u in urls if u.strip()]
-    return urls, None
+    return urls, None, source_name
+
+
+def _safe_filename(name: str) -> str:
+    """Strip filesystem-unsafe chars and collapse whitespace for a filename."""
+    name = re.sub(r"[^\w\s.\-]", "", name).strip()
+    name = re.sub(r"\s+", "-", name)
+    return (name or "scrape-results")[:80]
 
 
 def _normalize_url(u: str) -> str:
@@ -269,12 +302,13 @@ with col_a:
 
 # ── Scrape ─────────────────────────────────────────────────────────
 if scrape_clicked:
-    raw_urls, err = _collect_urls(text_input, uploaded_file)
+    raw_urls, err, source_name = _collect_urls(text_input, uploaded_file)
     if err:
         st.error(err)
     elif not raw_urls:
         st.error("No URLs detected in your input.")
     else:
+        st.session_state.source_name = source_name
         # ── Dedup + cap ──────────────────────────────────────────
         # Normalize for dedup (treat www / non-www / trailing slash as same)
         seen: dict[str, str] = {}
@@ -339,11 +373,12 @@ if scrape_clicked:
 
         # save to history
         st.session_state.history.insert(0, {
-            "when":   datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "count":  len(results),
-            "failed": len(failed),
-            "results": results,
+            "when":        datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "count":       len(results),
+            "failed":      len(failed),
+            "results":     results,
             "failed_urls": failed,
+            "source_name": source_name,
         })
         st.session_state.history = st.session_state.history[:HIST_MAX]
 
@@ -390,24 +425,29 @@ if results:
         },
     )
 
-    # Downloads
+    # Downloads — name file after source (Google Sheet title or uploaded filename)
+    base_name = _safe_filename(st.session_state.source_name) if st.session_state.source_name else "scrape-results"
+
     csv_buf = io.StringIO()
     df.to_csv(csv_buf, index=False)
     xlsx_buf = io.BytesIO()
     with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="Results", index=False)
 
+    if st.session_state.source_name:
+        st.caption(f"📁 Downloads will be named after: **{st.session_state.source_name}**")
+
     d1, d2, d3 = st.columns([1, 1, 4])
     with d1:
         st.download_button(
             "⬇ CSV", data=csv_buf.getvalue(),
-            file_name="scrape-results.csv", mime="text/csv",
+            file_name=f"{base_name}.csv", mime="text/csv",
             use_container_width=True,
         )
     with d2:
         st.download_button(
             "⬇ Excel", data=xlsx_buf.getvalue(),
-            file_name="scrape-results.xlsx",
+            file_name=f"{base_name}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
@@ -441,8 +481,9 @@ with st.sidebar:
                 )
                 c1, c2 = st.columns(2)
                 if c1.button("Restore", key=f"restore_{i}", use_container_width=True):
-                    st.session_state.results = h["results"]
-                    st.session_state.failed  = h["failed_urls"]
+                    st.session_state.results     = h["results"]
+                    st.session_state.failed      = h["failed_urls"]
+                    st.session_state.source_name = h.get("source_name")
                     st.rerun()
                 if c2.button("Delete", key=f"delete_{i}", use_container_width=True):
                     st.session_state.history.pop(i)
