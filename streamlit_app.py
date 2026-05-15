@@ -461,10 +461,11 @@ if results:
         "socials":      "Socials",
         "city":         "City",
         "language":     "Lang",
+        "tech":         "Built With",
         "contact_form": "Has form",
     })
     preferred = ["Website", "Company", "Key People", "Emails", "Phones",
-                 "City", "Lang", "Has form", "Socials"]
+                 "City", "Built With", "Lang", "Has form", "Socials"]
     df = df[[c for c in preferred if c in df.columns]]
 
     st.dataframe(

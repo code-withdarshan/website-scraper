@@ -692,6 +692,122 @@ def _whois_company(domain: str) -> str:
     return ""
 
 
+# ── Tech-stack detection ───────────────────────────────────────────
+# Pattern → display name. First match wins inside each category to keep
+# the output short (e.g. "WordPress" without all 50 plugins).
+# Order: CMS / site builder → e-commerce → JS framework → analytics
+TECH_FINGERPRINTS: list[tuple[str, re.Pattern]] = [
+    # ── CMS / site builders ─────────────────────────────────────
+    # WordPress — require actual WP file paths, not just the word "wordpress"
+    # (which appears in many sites' docs)
+    ("WordPress",     re.compile(r"/wp-(?:content|includes|json)/|wp-emoji-release|wp-block-library", re.I)),
+    ("Wix",           re.compile(r"static\.wixstatic\.com|_wix|wix\.com/_partials|wixCIDX", re.I)),
+    ("Squarespace",   re.compile(r"static1\.squarespace\.com|squarespace-cdn|Static\.SQUARESPACE", re.I)),
+    ("Webflow",       re.compile(r"data-wf-page|webflow\.com|wf-loaded|wf-domain", re.I)),
+    ("Shopify",       re.compile(r"cdn\.shopify\.com|shopify\.com|Shopify\.theme|shopify-section", re.I)),
+    ("Drupal",        re.compile(r"drupal-settings-json|sites/default/files|Drupal\.settings", re.I)),
+    ("Joomla",        re.compile(r"/components/com_|joomla\!|/templates/.+joomla", re.I)),
+    ("Ghost",         re.compile(r"ghost\.io|generator.*ghost|ghost-version", re.I)),
+    ("Magento",       re.compile(r"Magento_|mage/cookies|magento-init", re.I)),
+    ("HubSpot CMS",   re.compile(r"hs-scripts\.com|js\.hsforms\.net|hubspot\.com/_hcms", re.I)),
+    ("Weebly",        re.compile(r"weebly\.com|cdn2\.editmysite", re.I)),
+    ("GoHighLevel",   re.compile(r"msgsndr\.com|gohighlevel|highlevel\.app", re.I)),
+    ("GoDaddy Studio",re.compile(r"img1\.wsimg\.com|godaddysites|secureserver\.net/css", re.I)),
+    ("Duda",          re.compile(r"irp\.cdn-website\.com|lirp\.cdn-website|duda\.co", re.I)),
+    ("Framer",        re.compile(r"framerusercontent\.com|framer\.com/m/", re.I)),
+    ("Notion",        re.compile(r"notion\.so|super\.so/notion", re.I)),
+    ("Carrd",         re.compile(r"carrd\.co", re.I)),
+    ("Bubble.io",     re.compile(r"bubble\.io|run\.bubbleapps", re.I)),
+
+    # ── E-commerce ──────────────────────────────────────────────
+    # WooCommerce — require actual WC plugin/asset paths or body classes,
+    # not just the word "woocommerce" (which payment-processor docs mention)
+    ("WooCommerce",   re.compile(r"wp-content/plugins/woocommerce|woocommerce-(?:page|js|cart|checkout|product|loop|store|block)|wc-block-", re.I)),
+    ("BigCommerce",   re.compile(r"bigcommerce\.com|cdn\d?\.bcapps", re.I)),
+    ("PrestaShop",    re.compile(r"prestashop|var\s+prestashop\s*=", re.I)),
+    ("OpenCart",      re.compile(r"opencart|index\.php\?route=", re.I)),
+    ("Salesforce Commerce", re.compile(r"demandware\.net|sfcc-cdn", re.I)),
+
+    # ── JS frameworks ──────────────────────────────────────────
+    ("Next.js",       re.compile(r"__NEXT_DATA__|/_next/static|next/router", re.I)),
+    ("Nuxt",          re.compile(r"__NUXT__|/_nuxt/", re.I)),
+    ("Gatsby",        re.compile(r"gatsby-|/page-data\.json|___gatsby", re.I)),
+    ("Astro",         re.compile(r"astro-island|astro-slot", re.I)),
+    ("React",         re.compile(r"data-reactroot|data-reactid|react-dom", re.I)),
+    ("Vue.js",        re.compile(r"data-v-[0-9a-f]{8}|__vue__|/vue\.runtime", re.I)),
+    ("Angular",       re.compile(r"ng-version=|_nghost-|ng-app=|angular\.js", re.I)),
+    ("Svelte",        re.compile(r"svelte-[a-z0-9]{6}|__svelte", re.I)),
+
+    # ── Forms / interactive ─────────────────────────────────────
+    ("Mailchimp",     re.compile(r"mc\.us\d+\.list-manage\.com|mailchimp\.com/mc", re.I)),
+    ("HubSpot Forms", re.compile(r"js\.hsforms\.net|hbspt\.forms\.create", re.I)),
+    ("Typeform",      re.compile(r"typeform\.com/embed|tf-v1-widget", re.I)),
+    ("Calendly",      re.compile(r"calendly\.com/assets|calendly\.com/embed", re.I)),
+
+    # ── Analytics / tag managers ────────────────────────────────
+    ("Google Analytics", re.compile(r"google-analytics\.com|gtag\(.*G-|ga\(.*UA-", re.I)),
+    ("GTM",              re.compile(r"googletagmanager\.com/gtm", re.I)),
+    ("Meta Pixel",       re.compile(r"connect\.facebook\.net/.*fbevents|fbq\(.*track", re.I)),
+    ("Hotjar",           re.compile(r"static\.hotjar\.com|hotjar-", re.I)),
+
+    # ── CDN / infra ─────────────────────────────────────────────
+    ("Cloudflare",    re.compile(r"cdn-cgi/|__cf_email__|cloudflare-static", re.I)),
+    ("jQuery",        re.compile(r"jquery[.\-]\d", re.I)),
+    ("Bootstrap",     re.compile(r"bootstrap(?:\.min)?\.css|bootstrap@", re.I)),
+    ("Tailwind",      re.compile(r"tailwindcss|cdn\.tailwindcss\.com", re.I)),
+    ("Elementor",     re.compile(r"elementor|elementskit", re.I)),
+]
+
+# Category each fingerprint belongs to — we keep at most one CMS + one e-commerce
+# + one framework etc. so the column doesn't explode
+TECH_CATEGORY = {
+    "WordPress": "cms", "Wix": "cms", "Squarespace": "cms", "Webflow": "cms",
+    "Shopify": "cms", "Drupal": "cms", "Joomla": "cms", "Ghost": "cms",
+    "Magento": "cms", "HubSpot CMS": "cms", "Weebly": "cms",
+    "GoHighLevel": "cms", "GoDaddy Studio": "cms", "Duda": "cms",
+    "Framer": "cms", "Notion": "cms", "Carrd": "cms", "Bubble.io": "cms",
+    "WooCommerce": "ecom", "BigCommerce": "ecom", "PrestaShop": "ecom",
+    "OpenCart": "ecom", "Salesforce Commerce": "ecom",
+    "Next.js": "fw", "Nuxt": "fw", "Gatsby": "fw", "Astro": "fw",
+    "React": "fw", "Vue.js": "fw", "Angular": "fw", "Svelte": "fw",
+}
+
+
+def _detect_tech(soup: BeautifulSoup, raw_html: str) -> list[str]:
+    """Return a small ordered list of detected technologies for the page."""
+    found: list[str] = []
+    seen_cats: set[str] = set()
+    found_lower_blob = ""   # lowercased "found so far" for substring dedup
+
+    # 1. <meta name="generator"> — most authoritative
+    gen = soup.find("meta", attrs={"name": "generator"})
+    if gen and gen.get("content"):
+        g = gen["content"].strip()[:60]
+        found.append(g)
+        # Mark category to prevent the bare-name duplicate
+        for cat_name, cat in TECH_CATEGORY.items():
+            if cat_name.lower() in g.lower():
+                seen_cats.add(cat)
+        found_lower_blob = g.lower()
+
+    # 2. Fingerprint scan
+    for name, pattern in TECH_FINGERPRINTS:
+        cat = TECH_CATEGORY.get(name)
+        # Skip if we already have one in this category (keeps list short)
+        if cat and cat in seen_cats:
+            continue
+        # Skip if its name already appears in any earlier entry
+        if name.lower() in found_lower_blob:
+            continue
+        if pattern.search(raw_html):
+            found.append(name)
+            found_lower_blob += " " + name.lower()
+            if cat:
+                seen_cats.add(cat)
+
+    return found[:5]
+
+
 # ── Contact form detection ─────────────────────────────────────────
 def _has_contact_form(soup: BeautifulSoup) -> bool:
     """Returns True if the page looks like it has a working contact form."""
@@ -759,6 +875,7 @@ def scrape_url(url: str) -> dict | None:
     language      = _extract_language(home_soup)
     contact_form  = _has_contact_form(home_soup)
     people        = list(_extract_people(home_soup))
+    tech          = _detect_tech(home_soup, home_html)
 
     # ── 2. Contact page ─────────────────────────────────────────
     contact_url = _find_subpage(home_soup, base_url, CONTACT_LINK_RE)
@@ -816,11 +933,12 @@ def scrape_url(url: str) -> dict | None:
     return {
         "url":          domain,
         "company":      company,
-        "people":       ", ".join(seen_people[:5]),   # cap at 5 to keep cells readable
+        "people":       ", ".join(seen_people[:5]),
         "emails":       ", ".join(sorted(clean_emails)),
         "phones":       ", ".join(_dedup_phones(phones)) if phones else "",
         "socials":      ", ".join(f"{k}: {v}" for k, v in sorted(socials.items())),
         "city":         city,
         "language":     language,
+        "tech":         ", ".join(tech),
         "contact_form": "yes" if contact_form else "",
     }
