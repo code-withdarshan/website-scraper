@@ -252,6 +252,22 @@ def _fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> str | None:
 
 
 # ── Email extraction ────────────────────────────────────────────────
+def _decode_cfemail(hex_blob: str) -> str | None:
+    """
+    Decode a Cloudflare email-protection 'data-cfemail' value.
+    First byte is the XOR key; remaining bytes are XOR-encoded chars.
+    """
+    try:
+        if len(hex_blob) < 4 or len(hex_blob) % 2 != 0:
+            return None
+        key = int(hex_blob[:2], 16)
+        out = bytes(int(hex_blob[i:i + 2], 16) ^ key
+                    for i in range(2, len(hex_blob), 2)).decode("ascii")
+        return out if "@" in out and "." in out else None
+    except Exception:
+        return None
+
+
 def _add_email(emails: set, raw: str) -> None:
     cleaned = _clean_email(raw)
     if EMAIL_RE.match(cleaned):
@@ -260,14 +276,41 @@ def _add_email(emails: set, raw: str) -> None:
 
 def _emails_from_soup(soup: BeautifulSoup, raw_html: str = "") -> set[str]:
     emails: set[str] = set()
+
+    # 1. mailto: links
     for tag in soup.find_all("a", href=True):
         if tag["href"].lower().startswith("mailto:"):
             _add_email(emails, tag["href"][7:].split("?")[0])
+
+    # 2. Visible text regex
     for m in EMAIL_RE.finditer(soup.get_text(" ")):
         _add_email(emails, m.group())
+
+    # 3. Raw HTML regex (catches JS-embedded etc.)
     if raw_html:
         for m in EMAIL_RE.finditer(raw_html):
             _add_email(emails, m.group())
+
+    # 4. Cloudflare-protected emails (data-cfemail="…")
+    for tag in soup.find_all(attrs={"data-cfemail": True}):
+        decoded = _decode_cfemail(tag["data-cfemail"])
+        if decoded:
+            _add_email(emails, decoded)
+    if raw_html:
+        for m in re.finditer(r'data-cfemail=["\']([a-fA-F0-9]+)["\']', raw_html):
+            decoded = _decode_cfemail(m.group(1))
+            if decoded:
+                _add_email(emails, decoded)
+
+    # 5. HTML-entity obfuscation (&#64; for @, &#46; for .)
+    try:
+        from html import unescape
+        decoded_html = unescape(raw_html or soup.get_text(" "))
+        for m in EMAIL_RE.finditer(decoded_html):
+            _add_email(emails, m.group())
+    except Exception:
+        pass
+
     return emails
 
 
