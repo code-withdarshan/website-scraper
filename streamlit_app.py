@@ -532,29 +532,49 @@ with tab_filter:
                     "downloaded — make sure they are shared as 'Anyone with the link can view'."
                 )
 
-            EDU_ORG_RE = re.compile(r"(?:^|\.|@)(edu|org)(\.[a-z]{2,3})?(?:$|/|\?|#)", re.I)
+            EDU_ORG_RE = re.compile(r"(?:^|\.|@)(edu|org)(\.[a-z]{2,3})?(?:$|/|\?|#|\s|,|;)", re.I)
+            EMAIL_RE   = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
             kept: list[str] = []
-            seen: set[str] = set()
-            dup_count = 0
+            seen_lines: set[str] = set()
+            seen_emails: set[str] = set()
+            dup_line_count = 0
+            dup_email_count = 0
             edu_org_count = 0
 
             for line in raw_lines:
                 if EDU_ORG_RE.search(line):
                     edu_org_count += 1
                     continue
+
+                emails_in_line = [e.lower() for e in EMAIL_RE.findall(line)]
+
+                # If line contains email(s), drop the WHOLE line if any email already seen
+                if emails_in_line:
+                    if any(e in seen_emails for e in emails_in_line):
+                        dup_email_count += 1
+                        continue
+                    # Also drop if duplicate emails appear within the same line
+                    if len(set(emails_in_line)) != len(emails_in_line):
+                        # collapse to unique only
+                        pass
+                    for e in emails_in_line:
+                        seen_emails.add(e)
+
                 key = line.lower() if case_insensitive else line
-                if key in seen:
-                    dup_count += 1
+                if key in seen_lines:
+                    dup_line_count += 1
                     continue
-                seen.add(key)
+                seen_lines.add(key)
                 kept.append(line)
 
             total_in = len(raw_lines)
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Input", total_in)
             c2.metric("Kept", len(kept))
-            c3.metric("Duplicates removed", dup_count)
-            c4.metric(".edu / .org removed", edu_org_count)
+            c3.metric("Duplicate emails", dup_email_count)
+            c4.metric("Duplicate lines", dup_line_count)
+            c5.metric(".edu / .org removed", edu_org_count)
 
             if kept:
                 cleaned_text = "\n".join(kept)
