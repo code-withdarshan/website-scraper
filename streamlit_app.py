@@ -438,7 +438,9 @@ st.markdown(
 )
 
 # ── Input section ──────────────────────────────────────────────────
-tab_paste, tab_upload = st.tabs(["📝 Paste URLs", "📂 Upload File"])
+tab_paste, tab_upload, tab_filter = st.tabs(
+    ["📝 Paste URLs", "📂 Upload File", "🧹 Filter Only"]
+)
 
 text_input = ""
 uploaded_file = None
@@ -473,6 +475,131 @@ with tab_upload:
     )
     if uploaded_file:
         st.success(f"📄 {uploaded_file.name} ready to scrape")
+
+with tab_filter:
+    st.markdown(
+        '<div class="gsheet-tip"><b>Filter only — no scraping.</b> Paste rows '
+        '(URLs, emails or any text) <i>or</i> Google Sheet links. The tool removes '
+        '<b>duplicates</b> and any line containing a <code>.edu</code> or '
+        '<code>.org</code> domain, then gives you the cleaned list to download.</div>',
+        unsafe_allow_html=True,
+    )
+    filter_input = st.text_area(
+        label="Paste data to filter (one entry per line) or Google Sheet link(s)",
+        height=220,
+        placeholder=(
+            "example.com\n"
+            "harvard.edu       ← will be removed\n"
+            "wikipedia.org     ← will be removed\n"
+            "example.com       ← duplicate, will be removed\n\n"
+            "Or paste a Google Sheet URL to pull its Website column."
+        ),
+        key="filter_input",
+    )
+    case_insensitive = st.checkbox(
+        "Treat entries case-insensitively when deduping",
+        value=True,
+        key="filter_case_insensitive",
+    )
+    filter_clicked = st.button(
+        "🧹 Filter", type="primary", key="filter_btn", use_container_width=False
+    )
+
+    if filter_clicked:
+        raw_lines: list[str] = []
+        failed_sheets: list[str] = []
+
+        # Split on newlines / commas / semicolons / tabs
+        cands = [
+            s.strip() for s in re.split(r"[\n\r,;\t]+", filter_input or "") if s.strip()
+        ]
+        if not cands:
+            st.warning("Paste some data first.")
+        else:
+            for c in cands:
+                if GSHEET_RE.search(c):
+                    sheet_bytes, _title = _fetch_gsheet_csv(c)
+                    if sheet_bytes is None:
+                        failed_sheets.append(c)
+                        continue
+                    raw_lines.extend(_extract_urls_from_rows(_csv_rows(sheet_bytes)))
+                else:
+                    raw_lines.append(c)
+
+            if failed_sheets:
+                st.warning(
+                    f"⚠️ {len(failed_sheets)} Google Sheet link(s) could not be "
+                    "downloaded — make sure they are shared as 'Anyone with the link can view'."
+                )
+
+            EDU_ORG_RE = re.compile(r"(?:^|\.|@)(edu|org)(\.[a-z]{2,3})?(?:$|/|\?|#)", re.I)
+            kept: list[str] = []
+            seen: set[str] = set()
+            dup_count = 0
+            edu_org_count = 0
+
+            for line in raw_lines:
+                if EDU_ORG_RE.search(line):
+                    edu_org_count += 1
+                    continue
+                key = line.lower() if case_insensitive else line
+                if key in seen:
+                    dup_count += 1
+                    continue
+                seen.add(key)
+                kept.append(line)
+
+            total_in = len(raw_lines)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Input", total_in)
+            c2.metric("Kept", len(kept))
+            c3.metric("Duplicates removed", dup_count)
+            c4.metric(".edu / .org removed", edu_org_count)
+
+            if kept:
+                cleaned_text = "\n".join(kept)
+                st.text_area(
+                    "✅ Cleaned data",
+                    value=cleaned_text,
+                    height=300,
+                    key="filter_output",
+                )
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+                csv_buf = io.StringIO()
+                csv_writer = csv.writer(csv_buf)
+                csv_writer.writerow(["Website"])
+                for row in kept:
+                    csv_writer.writerow([row])
+
+                xlsx_buf = io.BytesIO()
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "Filtered"
+                ws.append(["Website"])
+                for row in kept:
+                    ws.append([row])
+                wb.save(xlsx_buf)
+
+                dl1, dl2 = st.columns(2)
+                with dl1:
+                    st.download_button(
+                        "⬇️ Download as .csv",
+                        data=csv_buf.getvalue().encode("utf-8"),
+                        file_name=f"filtered-{ts}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                with dl2:
+                    st.download_button(
+                        "⬇️ Download as .xlsx",
+                        data=xlsx_buf.getvalue(),
+                        file_name=f"filtered-{ts}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+            else:
+                st.info("Nothing left after filtering.")
 
 col_a, col_b = st.columns([1, 5])
 with col_a:
