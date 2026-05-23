@@ -506,10 +506,10 @@ with tab_filter:
     )
 
     if filter_clicked:
-        raw_lines: list[str] = []
         failed_sheets: list[str] = []
+        sheet_frames: list[pd.DataFrame] = []
+        plain_lines: list[str] = []
 
-        # Split on newlines / commas / semicolons / tabs
         cands = [
             s.strip() for s in re.split(r"[\n\r,;\t]+", filter_input or "") if s.strip()
         ]
@@ -522,9 +522,17 @@ with tab_filter:
                     if sheet_bytes is None:
                         failed_sheets.append(c)
                         continue
-                    raw_lines.extend(_extract_urls_from_rows(_csv_rows(sheet_bytes)))
+                    try:
+                        df = pd.read_csv(
+                            io.BytesIO(sheet_bytes),
+                            dtype=str,
+                            keep_default_na=False,
+                        )
+                        sheet_frames.append(df)
+                    except Exception as exc:
+                        st.error(f"Could not parse sheet: {exc}")
                 else:
-                    raw_lines.append(c)
+                    plain_lines.append(c)
 
             if failed_sheets:
                 st.warning(
@@ -532,80 +540,86 @@ with tab_filter:
                     "downloaded — make sure they are shared as 'Anyone with the link can view'."
                 )
 
-            EDU_ORG_RE = re.compile(r"(?:^|\.|@)(edu|org)(\.[a-z]{2,3})?(?:$|/|\?|#|\s|,|;)", re.I)
-            EMAIL_RE   = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+            if sheet_frames:
+                full_df = pd.concat(sheet_frames, ignore_index=True, sort=False).fillna("")
+                if plain_lines:
+                    extra = pd.DataFrame({full_df.columns[0]: plain_lines})
+                    full_df = pd.concat([full_df, extra], ignore_index=True, sort=False).fillna("")
+            elif plain_lines:
+                full_df = pd.DataFrame({"Value": plain_lines})
+            else:
+                full_df = pd.DataFrame()
 
-            kept: list[str] = []
-            seen_lines: set[str] = set()
-            seen_emails: set[str] = set()
-            dup_line_count = 0
-            dup_email_count = 0
-            edu_org_count = 0
-
-            for line in raw_lines:
-                if EDU_ORG_RE.search(line):
-                    edu_org_count += 1
-                    continue
-
-                emails_in_line = [e.lower() for e in EMAIL_RE.findall(line)]
-
-                # If line contains email(s), drop the WHOLE line if any email already seen
-                if emails_in_line:
-                    if any(e in seen_emails for e in emails_in_line):
-                        dup_email_count += 1
-                        continue
-                    # Also drop if duplicate emails appear within the same line
-                    if len(set(emails_in_line)) != len(emails_in_line):
-                        # collapse to unique only
-                        pass
-                    for e in emails_in_line:
-                        seen_emails.add(e)
-
-                key = line.lower() if case_insensitive else line
-                if key in seen_lines:
-                    dup_line_count += 1
-                    continue
-                seen_lines.add(key)
-                kept.append(line)
-
-            total_in = len(raw_lines)
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Input", total_in)
-            c2.metric("Kept", len(kept))
-            c3.metric("Duplicate emails", dup_email_count)
-            c4.metric("Duplicate lines", dup_line_count)
-            c5.metric(".edu / .org removed", edu_org_count)
-
-            if kept:
-                cleaned_text = "\n".join(kept)
-                st.text_area(
-                    "✅ Cleaned data",
-                    value=cleaned_text,
-                    height=300,
-                    key="filter_output",
+            if full_df.empty:
+                st.info("Nothing to filter.")
+            else:
+                EDU_ORG_RE = re.compile(
+                    r"(?:^|\.|@)(edu|org)(\.[a-z]{2,3})?(?:$|/|\?|#|\s|,|;|\Z)", re.I
                 )
+                EMAIL_RE = re.compile(
+                    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+                )
+
+                seen_rows: set[str] = set()
+                seen_emails: set[str] = set()
+                dup_row_count = 0
+                dup_email_count = 0
+                edu_org_count = 0
+                kept_rows: list[dict] = []
+
+                for _idx, row in full_df.iterrows():
+                    joined = " ".join(str(v) for v in row.values)
+
+                    if EDU_ORG_RE.search(joined):
+                        edu_org_count += 1
+                        continue
+
+                    emails_in_row = [e.lower() for e in EMAIL_RE.findall(joined)]
+                    if emails_in_row:
+                        if any(e in seen_emails for e in emails_in_row):
+                            dup_email_count += 1
+                            continue
+                        for e in emails_in_row:
+                            seen_emails.add(e)
+
+                    key = joined.lower() if case_insensitive else joined
+                    if key in seen_rows:
+                        dup_row_count += 1
+                        continue
+                    seen_rows.add(key)
+                    kept_rows.append(row.to_dict())
+
+                kept_df = pd.DataFrame(kept_rows, columns=full_df.columns) if kept_rows else pd.DataFrame(columns=full_df.columns)
+
+                total_in = len(full_df)
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Input rows", total_in)
+                c2.metric("Kept", len(kept_df))
+                c3.metric("Duplicate emails", dup_email_count)
+                c4.metric("Duplicate rows", dup_row_count)
+                c5.metric(".edu / .org removed", edu_org_count)
+
+            if not kept_df.empty:
+                st.markdown("**✅ Cleaned data**")
+                st.dataframe(kept_df, use_container_width=True, height=320)
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-                csv_buf = io.StringIO()
-                csv_writer = csv.writer(csv_buf)
-                csv_writer.writerow(["Website"])
-                for row in kept:
-                    csv_writer.writerow([row])
+                csv_bytes = kept_df.to_csv(index=False).encode("utf-8")
 
                 xlsx_buf = io.BytesIO()
                 wb = openpyxl.Workbook()
                 ws = wb.active
                 ws.title = "Filtered"
-                ws.append(["Website"])
-                for row in kept:
-                    ws.append([row])
+                ws.append(list(kept_df.columns))
+                for _, r in kept_df.iterrows():
+                    ws.append([str(v) for v in r.values])
                 wb.save(xlsx_buf)
 
                 dl1, dl2 = st.columns(2)
                 with dl1:
                     st.download_button(
                         "⬇️ Download as .csv",
-                        data=csv_buf.getvalue().encode("utf-8"),
+                        data=csv_bytes,
                         file_name=f"filtered-{ts}.csv",
                         mime="text/csv",
                         use_container_width=True,
