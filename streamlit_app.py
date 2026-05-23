@@ -69,7 +69,7 @@ if "source_name" not in st.session_state: st.session_state.source_name = None
 
 # ── Constants ──────────────────────────────────────────────────────
 MAX_WORKERS = 8
-MAX_URLS    = 500
+MAX_URLS    = 0   # 0 = unlimited; scrape every URL in the input
 HIST_MAX    = 5
 
 # Public usage counter (abacus.jasoncameron.dev — free, no auth, no PII)
@@ -497,15 +497,16 @@ with tab_filter:
         key="filter_input",
     )
     case_insensitive = st.checkbox(
-        "Treat entries case-insensitively when deduping",
+        "Treat values case-insensitively when comparing",
         value=True,
         key="filter_case_insensitive",
     )
-    filter_clicked = st.button(
-        "🧹 Filter", type="primary", key="filter_btn", use_container_width=False
+    load_clicked = st.button(
+        "📥 Load data", type="secondary", key="filter_load_btn"
     )
 
-    if filter_clicked:
+    # ── Stage 1: load pasted input into a DataFrame and cache it ──
+    if load_clicked:
         failed_sheets: list[str] = []
         sheet_frames: list[pd.DataFrame] = []
         plain_lines: list[str] = []
@@ -515,6 +516,7 @@ with tab_filter:
         ]
         if not cands:
             st.warning("Paste some data first.")
+            st.session_state.pop("filter_loaded_df", None)
         else:
             for c in cands:
                 if GSHEET_RE.search(c):
@@ -550,90 +552,134 @@ with tab_filter:
             else:
                 full_df = pd.DataFrame()
 
-            if full_df.empty:
-                st.info("Nothing to filter.")
+            st.session_state["filter_loaded_df"] = full_df
+
+    # ── Stage 2: show column picker + filter on cached df ──
+    loaded_df: pd.DataFrame = st.session_state.get("filter_loaded_df", pd.DataFrame())
+    if not loaded_df.empty:
+        st.markdown(f"**Loaded:** {len(loaded_df)} rows · {len(loaded_df.columns)} columns")
+
+        # Auto-detect likely dedup columns (Email > Phone > Website)
+        _PREFERRED_RE = re.compile(r"(?i)\b(email|e[-_ ]?mail|phone|mobile|website|url|domain)\b")
+        default_dedup_cols = [c for c in loaded_df.columns if _PREFERRED_RE.search(str(c))]
+        if not default_dedup_cols:
+            default_dedup_cols = list(loaded_df.columns)
+
+        dedup_cols = st.multiselect(
+            "Dedupe based on these column(s) — rows that share the same value(s) "
+            "in ALL selected columns will be treated as duplicates and only one is kept.",
+            options=list(loaded_df.columns),
+            default=default_dedup_cols,
+            key="filter_dedup_cols",
+            help="E.g. pick only 'Email' to keep one row per email address, regardless of "
+                 "other column differences like Last Contacted date.",
+        )
+
+        remove_edu_org = st.checkbox(
+            "Also remove rows containing .edu / .org domains",
+            value=True,
+            key="filter_remove_edu_org",
+        )
+
+        run_filter = st.button(
+            "🧹 Apply filter", type="primary", key="filter_apply_btn"
+        )
+
+        if run_filter:
+            if not dedup_cols:
+                st.warning("Pick at least one column to dedupe on.")
             else:
                 EDU_ORG_RE = re.compile(
                     r"(?:^|\.|@)(edu|org)(\.[a-z]{2,3})?(?:$|/|\?|#|\s|,|;|\Z)", re.I
                 )
-                EMAIL_RE = re.compile(
-                    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
-                )
 
-                seen_rows: set[str] = set()
-                seen_emails: set[str] = set()
-                dup_row_count = 0
-                dup_email_count = 0
+                seen_keys: set[tuple] = set()
+                dup_count = 0
+                blank_key_count = 0
                 edu_org_count = 0
                 kept_rows: list[dict] = []
 
-                for _idx, row in full_df.iterrows():
-                    joined = " ".join(str(v) for v in row.values)
-
-                    if EDU_ORG_RE.search(joined):
-                        edu_org_count += 1
-                        continue
-
-                    emails_in_row = [e.lower() for e in EMAIL_RE.findall(joined)]
-                    if emails_in_row:
-                        if any(e in seen_emails for e in emails_in_row):
-                            dup_email_count += 1
+                for _idx, row in loaded_df.iterrows():
+                    if remove_edu_org:
+                        joined = " ".join(str(v) for v in row.values)
+                        if EDU_ORG_RE.search(joined):
+                            edu_org_count += 1
                             continue
-                        for e in emails_in_row:
-                            seen_emails.add(e)
 
-                    key = joined.lower() if case_insensitive else joined
-                    if key in seen_rows:
-                        dup_row_count += 1
+                    # Build dedup key from the chosen columns
+                    key_parts = []
+                    for col in dedup_cols:
+                        v = str(row.get(col, "")).strip()
+                        if case_insensitive:
+                            v = v.lower()
+                        key_parts.append(v)
+                    key = tuple(key_parts)
+
+                    # If every selected column is blank, treat as "no key" and keep
+                    if all(p == "" for p in key_parts):
+                        blank_key_count += 1
+                        kept_rows.append(row.to_dict())
                         continue
-                    seen_rows.add(key)
+
+                    if key in seen_keys:
+                        dup_count += 1
+                        continue
+                    seen_keys.add(key)
                     kept_rows.append(row.to_dict())
 
-                kept_df = pd.DataFrame(kept_rows, columns=full_df.columns) if kept_rows else pd.DataFrame(columns=full_df.columns)
+                kept_df = (
+                    pd.DataFrame(kept_rows, columns=loaded_df.columns)
+                    if kept_rows
+                    else pd.DataFrame(columns=loaded_df.columns)
+                )
 
-                total_in = len(full_df)
-                c1, c2, c3, c4, c5 = st.columns(5)
+                total_in = len(loaded_df)
+                c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Input rows", total_in)
                 c2.metric("Kept", len(kept_df))
-                c3.metric("Duplicate emails", dup_email_count)
-                c4.metric("Duplicate rows", dup_row_count)
-                c5.metric(".edu / .org removed", edu_org_count)
-
-            if not kept_df.empty:
-                st.markdown("**✅ Cleaned data**")
-                st.dataframe(kept_df, use_container_width=True, height=320)
-                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-
-                csv_bytes = kept_df.to_csv(index=False).encode("utf-8")
-
-                xlsx_buf = io.BytesIO()
-                wb = openpyxl.Workbook()
-                ws = wb.active
-                ws.title = "Filtered"
-                ws.append(list(kept_df.columns))
-                for _, r in kept_df.iterrows():
-                    ws.append([str(v) for v in r.values])
-                wb.save(xlsx_buf)
-
-                dl1, dl2 = st.columns(2)
-                with dl1:
-                    st.download_button(
-                        "⬇️ Download as .csv",
-                        data=csv_bytes,
-                        file_name=f"filtered-{ts}.csv",
-                        mime="text/csv",
-                        use_container_width=True,
+                c3.metric("Duplicates removed", dup_count)
+                c4.metric(".edu / .org removed", edu_org_count)
+                if blank_key_count:
+                    st.caption(
+                        f"ℹ️ {blank_key_count} row(s) had blank values in all dedup "
+                        "columns and were kept as-is."
                     )
-                with dl2:
-                    st.download_button(
-                        "⬇️ Download as .xlsx",
-                        data=xlsx_buf.getvalue(),
-                        file_name=f"filtered-{ts}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-            else:
-                st.info("Nothing left after filtering.")
+
+                if not kept_df.empty:
+                    st.markdown("**✅ Cleaned data**")
+                    st.dataframe(kept_df, use_container_width=True, height=320)
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+                    csv_bytes = kept_df.to_csv(index=False).encode("utf-8")
+
+                    xlsx_buf = io.BytesIO()
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Filtered"
+                    ws.append(list(kept_df.columns))
+                    for _, r in kept_df.iterrows():
+                        ws.append([str(v) for v in r.values])
+                    wb.save(xlsx_buf)
+
+                    dl1, dl2 = st.columns(2)
+                    with dl1:
+                        st.download_button(
+                            "⬇️ Download as .csv",
+                            data=csv_bytes,
+                            file_name=f"filtered-{ts}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                    with dl2:
+                        st.download_button(
+                            "⬇️ Download as .xlsx",
+                            data=xlsx_buf.getvalue(),
+                            file_name=f"filtered-{ts}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+                else:
+                    st.info("Nothing left after filtering.")
 
 col_a, col_b = st.columns([1, 5])
 with col_a:
@@ -689,8 +735,9 @@ if scrape_clicked:
                     kept.append(u)
             urls = kept
 
-        capped = max(0, len(urls) - MAX_URLS)
-        if capped:
+        capped = 0
+        if MAX_URLS and len(urls) > MAX_URLS:
+            capped = len(urls) - MAX_URLS
             urls = urls[:MAX_URLS]
 
         # ── Pre-flight info banners ─────────────────────────────
