@@ -15,6 +15,8 @@ import csv
 import io
 import json
 import re
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -27,6 +29,32 @@ import streamlit as st
 import xlrd
 
 from scraper import scrape_url, strip_tracking_params
+
+
+# ── Playwright Chromium bootstrap (Streamlit Cloud needs this once) ─
+# Chromium isn't bundled with the playwright pip package — it must be
+# downloaded with `playwright install chromium`. Locally users do this
+# manually; on Streamlit Cloud we trigger it on first launch and cache.
+@st.cache_resource(show_spinner=False)
+def _ensure_chromium_installed() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            p.chromium.launch(headless=True).close()
+        return True
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False, timeout=180,
+        )
+        return True
+    except Exception:
+        return False
+
+
+_ensure_chromium_installed()
 
 # ── Page config ────────────────────────────────────────────────────
 st.set_page_config(

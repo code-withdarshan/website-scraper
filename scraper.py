@@ -32,6 +32,14 @@ try:
 except ImportError:
     _whois_lib = None
 
+# Playwright is optional — used only as a fallback for JS-rendered sites
+# where the email isn't in the raw HTML the server sends
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -249,6 +257,71 @@ def _fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> str | None:
             log.debug("fetch err %s: %s", url, exc)
             break
     return None
+
+
+# ── Playwright fallback — for JS-rendered sites ────────────────────
+# Many modern sites (Vue/React/custom SPAs) inject the contact email into the
+# DOM via JavaScript after page load. `requests` only sees the raw server HTML,
+# so the email is invisible. Playwright runs a real browser and returns the
+# DOM after JS executes. Used only when the normal pipeline finds no email.
+_render_tls = threading.local()
+
+
+def _get_render_browser():
+    """Lazy thread-local Playwright browser. Returns None if unavailable."""
+    if not _PLAYWRIGHT_AVAILABLE:
+        return None
+    if getattr(_render_tls, "browser", None):
+        return _render_tls.browser
+    try:
+        _render_tls.pw = _sync_playwright().start()
+        _render_tls.browser = _render_tls.pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        return _render_tls.browser
+    except Exception as exc:
+        log.warning("Playwright launch failed (JS fallback disabled): %s", exc)
+        _render_tls.browser = None
+        _render_tls.pw = None
+        return None
+
+
+def _fetch_rendered(url: str, timeout_ms: int = 15000) -> str | None:
+    """Fetch a URL after JavaScript executes. Returns rendered HTML or None."""
+    if not _PLAYWRIGHT_AVAILABLE:
+        return None
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    url = strip_tracking_params(url)
+    if not _is_safe_url(url) or not _allowed_by_robots(url):
+        return None
+    browser = _get_render_browser()
+    if browser is None:
+        return None
+    ctx = None
+    try:
+        ctx = browser.new_context(
+            user_agent=BROWSER_HEADERS["User-Agent"],
+            viewport={"width": 1280, "height": 800},
+        )
+        page = ctx.new_page()
+        page.goto(url, timeout=timeout_ms, wait_until="networkidle")
+        # Best-effort wait for a mailto link to appear (footer email injection)
+        try:
+            page.wait_for_selector('a[href^="mailto:"]', timeout=2500)
+        except Exception:
+            pass
+        return page.content()
+    except Exception as exc:
+        log.debug("Rendered fetch failed for %s: %s", url, exc)
+        return None
+    finally:
+        if ctx:
+            try:
+                ctx.close()
+            except Exception:
+                pass
 
 
 # ── Email extraction ────────────────────────────────────────────────
@@ -1127,6 +1200,27 @@ def scrape_url(url: str) -> dict | None:
                 # About page: whole page is fair game — it IS the about page
                 people.extend(_extract_people(a_soup, allow_full_page=True))
         clean_emails = [e for e in emails if not _is_junk_email(e)]
+
+    # ── JS-rendering fallback (only if no email found yet) ───────
+    # Modern sites often inject the footer email via JavaScript. Re-fetch
+    # the homepage (and contact page if any) with a real browser.
+    if not clean_emails and _PLAYWRIGHT_AVAILABLE:
+        for js_url in [base_url, contact_url]:
+            if not js_url:
+                continue
+            rendered = _fetch_rendered(js_url)
+            if not rendered:
+                continue
+            r_soup = BeautifulSoup(rendered, "html.parser")
+            emails  |= _emails_from_soup(r_soup, rendered)
+            phones  |= _phones_from_soup(r_soup)
+            for k, v in _socials_from_soup(r_soup, rendered).items():
+                socials.setdefault(k, v)
+            if not city:    city    = _extract_city(r_soup, rendered)
+            if not company: company = _extract_company(r_soup)
+            clean_emails = [e for e in emails if not _is_junk_email(e)]
+            if clean_emails:
+                break
 
     # ── WHOIS fallback if no company name found yet ──────────────
     domain = urlparse(base_url).netloc or raw
