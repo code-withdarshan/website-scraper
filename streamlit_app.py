@@ -115,6 +115,10 @@ if "source_name" not in st.session_state: st.session_state.source_name = None
 #   {"remaining": [...], "done": [...], "results": [...], "failed": [...],
 #    "source_name": str, "total": int}
 if "scrape_state" not in st.session_state: st.session_state.scrape_state = None
+# Scrape IDs the user explicitly discarded this session. Even if the DB delete
+# fails (lock contention, disk pressure on Cloud), the banner stays hidden —
+# the next refresh skips any scrape ID in this set.
+if "discarded_ids" not in st.session_state: st.session_state.discarded_ids = set()
 
 # ── Constants ──────────────────────────────────────────────────────
 # 5 workers strikes a balance between throughput and Streamlit Cloud's
@@ -483,6 +487,8 @@ def _refresh_scrape_state_from_db() -> None:
 
     Called at the top of each rerun so resume works across page refreshes, OOM
     kills, and Cloud container restarts (anything that wipes session_state).
+    Skips any scrape ID the user has explicitly discarded this session — so a
+    Discard click is always honored, even if the DB delete failed silently.
     """
     if st.session_state.scrape_state:
         return  # Already populated this rerun
@@ -491,6 +497,8 @@ def _refresh_scrape_state_from_db() -> None:
     if not active or active["pending"] == 0:
         return
     sid = active["id"]
+    if sid in st.session_state.discarded_ids:
+        return  # User clicked Discard — don't repopulate
     st.session_state.scrape_state = {
         "id":           sid,
         "total":        active["total"],
@@ -503,15 +511,25 @@ def _refresh_scrape_state_from_db() -> None:
     }
 
 
-def _clear_scrape_state() -> None:
-    """Discard the active scrape (deletes its DB rows + clears session_state)."""
+def _clear_scrape_state() -> bool:
+    """Discard the active scrape. Returns True if anything was discarded.
+
+    Always wins for the current session — the scrape ID is added to a
+    'discarded' set in session_state, so even if the DB delete fails (lock
+    contention, disk pressure) the banner won't reappear on the next refresh.
+    """
     state = st.session_state.scrape_state
-    if state and state.get("id"):
+    sid = state.get("id") if state else None
+    db_delete_ok = True
+    if sid:
+        st.session_state.discarded_ids.add(sid)
         try:
-            db.delete_scrape(_get_db(), state["id"])
-        except Exception:
-            pass
+            db.delete_scrape(_get_db(), sid)
+        except Exception as exc:
+            db_delete_ok = False
+            print(f"[db] delete_scrape({sid}) failed: {exc}")
     st.session_state.scrape_state = None
+    return bool(sid) and db_delete_ok
 
 
 _refresh_scrape_state_from_db()
@@ -721,6 +739,8 @@ if _pending and _pending.get("remaining"):
     with rc3:
         if st.button("🗑 Discard", use_container_width=True, key="discard_btn"):
             _clear_scrape_state()
+            # Toast survives the rerun so the user sees confirmation
+            st.toast("Discarded the unfinished scrape.", icon="🗑")
             st.rerun()
 
     # If the user clicked Resume, run the scrape RIGHT HERE so the progress
@@ -1333,7 +1353,12 @@ with st.sidebar:
                     st.session_state.source_name = h.get("source_name")
                     st.rerun()
                 if c2.button("Delete", key=f"hist_del_{h['id']}", use_container_width=True):
-                    db.delete_scrape(_get_db(), h["id"])
+                    # Always honor the click for this session, even if DB delete fails
+                    st.session_state.discarded_ids.add(h["id"])
+                    try:
+                        db.delete_scrape(_get_db(), h["id"])
+                    except Exception as exc:
+                        print(f"[db] delete_scrape({h['id']}) failed: {exc}")
                     # If the deleted row was the active scrape, clear the banner too
                     if (st.session_state.scrape_state
                         and st.session_state.scrape_state.get("id") == h["id"]):
