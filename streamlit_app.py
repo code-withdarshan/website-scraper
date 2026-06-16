@@ -125,6 +125,16 @@ MAX_WORKERS = 5
 MAX_URLS    = 0   # 0 = unlimited; scrape every URL in the input
 HIST_MAX    = 5
 
+# ── Batching ────────────────────────────────────────────────────────
+# Instead of submitting every URL to one big thread pool, we process in
+# small batches with a brief pause between them. This:
+#   • Recycles worker threads between batches so accumulated memory is freed
+#   • Forces GC between batches → Chromium teardown actually releases RAM
+#   • Gives the Streamlit Cloud container breathing room → fewer OOM kills
+#   • Lets the user see steady progress instead of a long silent stall
+BATCH_SIZE      = 25
+BATCH_PAUSE_SEC = 3
+
 
 # Public usage counter (abacus.jasoncameron.dev — free, no auth, no PII)
 COUNTER_NS  = "email-scraper-darshan"   # unique to this app
@@ -447,6 +457,7 @@ def _estimate_time(unique_urls: list[str]) -> tuple[int, int]:
     """
     Rough wall-clock estimate in seconds + unique domain count.
     Assumes ~4s per URL, MAX_WORKERS in parallel, throttled to 1 req/sec per domain.
+    Adds the inter-batch pause time so the estimate reflects what the user actually sees.
     """
     if not unique_urls:
         return 0, 0
@@ -460,6 +471,9 @@ def _estimate_time(unique_urls: list[str]) -> tuple[int, int]:
     #   a) worker capacity: n / MAX_WORKERS * 4s per URL
     #   b) per-domain serial scheduling: max_per_domain * 4s
     est = max(n / MAX_WORKERS * 4, max_per_domain * 4, 3)
+    # Add cool-down between batches
+    n_pauses = max(0, (n + BATCH_SIZE - 1) // BATCH_SIZE - 1)
+    est += n_pauses * BATCH_PAUSE_SEC
     return int(est), len(domains_count)
 
 
@@ -504,55 +518,82 @@ _refresh_scrape_state_from_db()
 
 
 def _run_scrape(urls_to_process: list[str]) -> None:
-    """Process URLs and write each result to the DB as it completes.
+    """Process URLs in small batches, writing each result to the DB as it completes.
+
+    Each batch uses a fresh ThreadPoolExecutor so worker threads + their
+    accumulated state (Playwright contexts, requests sessions) are torn down
+    and garbage-collected between batches. A brief pause between batches lets
+    the OS reclaim memory before the next burst.
 
     The DB is the source of truth — if the process dies mid-scrape, refreshing
     the page brings the resume banner back with everything already done.
     """
+    import gc
+
     state = st.session_state.scrape_state
     sid = state["id"]
     total = state["total"]
     done_count = state["done_count"]
     conn = _get_db()
 
+    total_batches = (len(urls_to_process) + BATCH_SIZE - 1) // BATCH_SIZE
     progress = st.progress(
         done_count / total if total else 0,
         text=f"Scraping {done_count} / {total}…",
     )
+    batch_status = st.empty()
     ticker = st.empty()
     ticker_lines: list[str] = []
 
     try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(scrape_url, u): u for u in urls_to_process}
-            for f in as_completed(futures):
-                u = futures[f]
-                try:
-                    r = f.result()
-                except Exception:
-                    r = None
-                if r:
-                    state["results"].append(r)
-                    db.mark_url_done(conn, sid, u, r)
-                    ticker_lines.insert(0, f"✅ **{u}** — {r['emails'][:80]}")
-                else:
-                    state["failed"].append(u)
-                    db.mark_url_failed(conn, sid, u)
-                    ticker_lines.insert(0, f"❌ **{u}** — no email")
-                try:
-                    state["remaining"].remove(u)
-                except ValueError:
-                    pass
-                done_count += 1
-                state["done_count"] = done_count
+        for batch_idx in range(total_batches):
+            batch_start = batch_idx * BATCH_SIZE
+            batch = urls_to_process[batch_start:batch_start + BATCH_SIZE]
+            batch_status.info(
+                f"📦 **Batch {batch_idx + 1} of {total_batches}** "
+                f"— processing {len(batch)} URL{'s' if len(batch) != 1 else ''}…"
+            )
 
-                progress.progress(
-                    done_count / total,
-                    text=f"Scraping {done_count} / {total}…",
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                futures = {ex.submit(scrape_url, u): u for u in batch}
+                for f in as_completed(futures):
+                    u = futures[f]
+                    try:
+                        r = f.result()
+                    except Exception:
+                        r = None
+                    if r:
+                        state["results"].append(r)
+                        db.mark_url_done(conn, sid, u, r)
+                        ticker_lines.insert(0, f"✅ **{u}** — {r['emails'][:80]}")
+                    else:
+                        state["failed"].append(u)
+                        db.mark_url_failed(conn, sid, u)
+                        ticker_lines.insert(0, f"❌ **{u}** — no email")
+                    try:
+                        state["remaining"].remove(u)
+                    except ValueError:
+                        pass
+                    done_count += 1
+                    state["done_count"] = done_count
+
+                    progress.progress(
+                        done_count / total,
+                        text=f"Scraping {done_count} / {total}…",
+                    )
+                    ticker.markdown("\n".join(ticker_lines[:15]))
+
+            # Between-batch cleanup: force GC, brief pause
+            if batch_idx < total_batches - 1:
+                gc.collect()
+                batch_status.info(
+                    f"⏸ Cooling down ({BATCH_PAUSE_SEC}s) before batch "
+                    f"{batch_idx + 2} of {total_batches}…"
                 )
-                ticker.markdown("\n".join(ticker_lines[:15]))
+                time.sleep(BATCH_PAUSE_SEC)
     finally:
         progress.empty()
+        batch_status.empty()
         ticker.empty()
 
 
