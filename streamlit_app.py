@@ -41,28 +41,36 @@ def _get_db():
 
 # ── Playwright Chromium bootstrap (Streamlit Cloud needs this once) ─
 # Chromium isn't bundled with the playwright pip package — it must be
-# downloaded with `playwright install chromium`. Locally users do this
-# manually; on Streamlit Cloud we trigger it on first launch and cache.
+# downloaded with `playwright install chromium` (~300 MB, takes 2-3 minutes
+# the first time). Run this in a background thread so the UI loads
+# immediately. The JS-rendering fallback gracefully no-ops until Chromium
+# is ready; the normal requests-based pipeline doesn't need it at all.
 @st.cache_resource(show_spinner=False)
-def _ensure_chromium_installed() -> bool:
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            p.chromium.launch(headless=True).close()
-        return True
-    except Exception:
-        pass
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=False, timeout=180,
-        )
-        return True
-    except Exception:
-        return False
+def _bootstrap_chromium_async():
+    import threading
+
+    def _install():
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                p.chromium.launch(headless=True).close()
+            return
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                check=False, timeout=300,
+            )
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_install, daemon=True)
+    t.start()
+    return t
 
 
-_ensure_chromium_installed()
+_bootstrap_chromium_async()
 
 # ── Page config ────────────────────────────────────────────────────
 st.set_page_config(
