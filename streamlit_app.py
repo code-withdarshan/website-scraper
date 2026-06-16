@@ -79,14 +79,16 @@ st.set_page_config(
     page_title="Email & Contact Scraper",
     page_icon="📧",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
-# Hide default Streamlit chrome
+# Hide default Streamlit chrome — but keep the header visible so the
+# sidebar-toggle (☰) button stays accessible. Hiding the full header here
+# previously left users with no way to open the sidebar at all.
 st.markdown(
     """
     <style>
-      #MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden; }
+      #MainMenu, footer { visibility: hidden; }
       .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
       .stMetric { background:#f8fafc; border:1px solid #e2e8f0; border-radius:.75rem; padding:.75rem; }
       .hero {
