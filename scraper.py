@@ -297,12 +297,16 @@ def _fetch_rendered(url: str, timeout_ms: int = 12000) -> str | None:
                 viewport={"width": 1280, "height": 800},
             )
             page = ctx.new_page()
-            # `domcontentloaded` is much faster than `networkidle` (5-10x) and is
-            # enough for SPAs that inject contact info on initial hydration.
-            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-            # Best-effort wait for a mailto link to appear (footer email injection)
+            # `load` waits for the window.load event — slower than
+            # `domcontentloaded` but ~3x faster than `networkidle`, and it
+            # catches SPAs whose footer email is injected during initial
+            # hydration (which often finishes after DOMContentLoaded).
+            page.goto(url, timeout=timeout_ms, wait_until="load")
+            # Then give the page up to 4s to inject the mailto element. On
+            # heavy SPAs this is the difference between getting the email
+            # and missing it entirely.
             try:
-                page.wait_for_selector('a[href^="mailto:"]', timeout=2500)
+                page.wait_for_selector('a[href^="mailto:"]', timeout=4000)
             except Exception:
                 pass
             return page.content()

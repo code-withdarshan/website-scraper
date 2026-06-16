@@ -12,7 +12,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
-COPY app.py scraper.py ./
+# Note: the Streamlit entrypoint (streamlit_app.py) needs db.py too. We copy
+# everything the runtime imports so either app.py (Flask) or streamlit_app.py
+# can be used as the entrypoint without a broken import.
+COPY app.py scraper.py db.py streamlit_app.py ./
 COPY templates ./templates
 COPY static ./static
 

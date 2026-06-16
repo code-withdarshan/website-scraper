@@ -292,7 +292,11 @@ def export():
     body = request.get_json(silent=True) or {}
     rows = body.get("results", [])
     fmt  = (body.get("format") or "csv").lower()
-    fieldnames = ["url", "emails", "phones", "socials", "city"]
+    # Keep this in sync with the dict returned by scraper.scrape_url
+    fieldnames = [
+        "url", "company", "niche", "people", "emails", "phones",
+        "socials", "city", "language", "tech", "contact_form",
+    ]
 
     # Normalize each row to have all fields
     for r in rows:

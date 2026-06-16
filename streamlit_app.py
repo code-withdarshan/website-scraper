@@ -564,11 +564,20 @@ def _run_scrape(urls_to_process: list[str]) -> None:
                         r = None
                     if r:
                         state["results"].append(r)
-                        db.mark_url_done(conn, sid, u, r)
+                        # A transient SQLite error (locked file, disk pressure)
+                        # must not kill the whole scrape — the URL will be
+                        # re-processed on resume since it stays 'pending' in DB.
+                        try:
+                            db.mark_url_done(conn, sid, u, r)
+                        except Exception as exc:
+                            print(f"[db] mark_url_done failed for {u}: {exc}")
                         ticker_lines.insert(0, f"✅ **{u}** — {r['emails'][:80]}")
                     else:
                         state["failed"].append(u)
-                        db.mark_url_failed(conn, sid, u)
+                        try:
+                            db.mark_url_failed(conn, sid, u)
+                        except Exception as exc:
+                            print(f"[db] mark_url_failed failed for {u}: {exc}")
                         ticker_lines.insert(0, f"❌ **{u}** — no email")
                     try:
                         state["remaining"].remove(u)
