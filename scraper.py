@@ -269,7 +269,7 @@ def _fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> str | None:
 # on Streamlit Cloud (~1 GB free tier) when many worker threads need JS rendering
 # at once, we (a) cap concurrent renders globally with a semaphore, and
 # (b) start + stop Playwright per call so no Chromium is left running idle.
-_RENDER_SEMAPHORE = threading.Semaphore(2)  # max 2 concurrent Chromium instances
+_RENDER_SEMAPHORE = threading.Semaphore(1)  # max 1 concurrent Chromium — bounds peak memory
 
 
 def _fetch_rendered(url: str, timeout_ms: int = 12000) -> str | None:
