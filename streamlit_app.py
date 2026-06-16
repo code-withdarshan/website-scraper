@@ -15,6 +15,7 @@ import csv
 import io
 import json
 import re
+import os
 import subprocess
 import sys
 import time
@@ -613,6 +614,15 @@ def _run_scrape(urls_to_process: list[str]) -> None:
             # Between-batch cleanup: force GC, brief pause
             if batch_idx < total_batches - 1:
                 gc.collect()
+                # Diagnostic: print memory + chromium-process counts to the
+                # terminal so the user can spot a leak. If the scrape stops
+                # mid-run, scrolling back through the start-streamlit.bat
+                # window shows exactly what was happening.
+                _log_batch_diagnostics(batch_idx + 1, total_batches, done_count, total)
+                # Windows-specific: kill stray chromium.exe processes that
+                # didn't exit cleanly after browser.close(). This is the main
+                # reason local scrapes stall around 100 URLs on Windows.
+                _sweep_orphan_chromium_windows()
                 batch_status.info(
                     f"⏸ Cooling down ({BATCH_PAUSE_SEC}s) before batch "
                     f"{batch_idx + 2} of {total_batches}…"
@@ -622,6 +632,83 @@ def _run_scrape(urls_to_process: list[str]) -> None:
         progress.empty()
         batch_status.empty()
         ticker.empty()
+
+
+def _process_memory_mb() -> float:
+    """Return this process's resident memory in MB. -1 if unsupported."""
+    try:
+        import resource as _resource  # POSIX (Linux/macOS)
+        rss_kb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        return rss_kb / 1024 if rss_kb > 100_000 else rss_kb  # Linux=KB, macOS=B
+    except Exception:
+        pass
+    if sys.platform != "win32":
+        return -1
+    try:
+        import csv as _csv, io as _io
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {os.getpid()}", "/FO", "CSV", "/NH"],
+            text=True, timeout=3,
+        )
+        row = next(_csv.reader(_io.StringIO(out.strip())))
+        kb = int(row[-1].replace(" K", "").replace(",", "").replace(".", ""))
+        return kb / 1024
+    except Exception:
+        return -1
+
+
+def _count_chromium_windows() -> int:
+    """Count chromium.exe processes (Windows). 0 on other OSes or on error."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq chromium.exe", "/FO", "CSV", "/NH"],
+            text=True, timeout=3,
+        )
+        # If no matches, tasklist prints "INFO: No tasks…" — count CSV rows
+        return sum(1 for line in out.strip().splitlines() if line.startswith('"chromium'))
+    except Exception:
+        return 0
+
+
+def _log_batch_diagnostics(batch_done: int, batch_total: int, urls_done: int, urls_total: int) -> None:
+    """Print one line of resource info to the terminal. Best-effort, never raises."""
+    import threading as _th
+    mem_mb = _process_memory_mb()
+    chromium_n = _count_chromium_windows()
+    print(
+        f"[scrape] batch {batch_done}/{batch_total} done · "
+        f"{urls_done}/{urls_total} URLs · "
+        f"mem={mem_mb:.0f}MB · threads={_th.active_count()}"
+        + (f" · orphan chromium={chromium_n}" if chromium_n else ""),
+        flush=True,
+    )
+
+
+def _sweep_orphan_chromium_windows() -> None:
+    """Kill any chromium.exe processes that weren't cleaned up by browser.close().
+
+    Windows-only. On Linux/macOS this is a no-op. Each Chromium browser spawns
+    5-7 child processes (GPU, renderer, network service, etc.). Even when the
+    parent exits, the children sometimes linger as orphans. Over hundreds of
+    JS-rendered fetches they accumulate and eat hundreds of MB — the main
+    reason local Windows scrapes mysteriously stall around 100 URLs.
+
+    Best-effort: uses taskkill /F. Won't touch your regular Chrome browser
+    (that's chrome.exe, not chromium.exe). Errors are swallowed silently.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "chromium.exe", "/T"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 
 def _finalize_scrape() -> None:
@@ -705,14 +792,13 @@ conservative_mode = st.sidebar.checkbox(
 )
 # Apply the toggle by mutating module-level constants the scrape loop reads.
 # Also sets SCRAPER_SKIP_JS so scraper.py's _fetch_rendered skips Playwright.
-import os as _os
 if conservative_mode:
     MAX_WORKERS     = 2
     BATCH_SIZE      = 10
     BATCH_PAUSE_SEC = 15
-    _os.environ["SCRAPER_SKIP_JS"] = "1"
+    os.environ["SCRAPER_SKIP_JS"] = "1"
 else:
-    _os.environ.pop("SCRAPER_SKIP_JS", None)
+    os.environ.pop("SCRAPER_SKIP_JS", None)
 
 st.sidebar.markdown("---")
 
