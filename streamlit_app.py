@@ -28,7 +28,15 @@ import requests
 import streamlit as st
 import xlrd
 
+import db
 from scraper import scrape_url, strip_tracking_params
+
+
+# ── Single SQLite connection shared across reruns ──────────────────
+@st.cache_resource(show_spinner=False)
+def _get_db():
+    """Open one DB connection per app instance. Schema initialized on first call."""
+    return db.connect()
 
 
 # ── Playwright Chromium bootstrap (Streamlit Cloud needs this once) ─
@@ -109,10 +117,6 @@ MAX_WORKERS = 5
 MAX_URLS    = 0   # 0 = unlimited; scrape every URL in the input
 HIST_MAX    = 5
 
-# Resume-state disk persistence — survives process restarts (incl. OOM kill on Cloud)
-import os
-import tempfile
-SCRAPE_STATE_FILE = os.path.join(tempfile.gettempdir(), "scraper_progress.json")
 
 # Public usage counter (abacus.jasoncameron.dev — free, no auth, no PII)
 COUNTER_NS  = "email-scraper-darshan"   # unique to this app
@@ -451,55 +455,57 @@ def _estimate_time(unique_urls: list[str]) -> tuple[int, int]:
     return int(est), len(domains_count)
 
 
-# ── Scrape state persistence (for resume after crash / disconnect) ──
-def _save_scrape_state() -> None:
-    """Write current scrape_state to disk so it survives process restarts."""
-    state = st.session_state.scrape_state
-    if not state:
+# ── Scrape state — backed by SQLite for crash / disconnect survival ──
+def _refresh_scrape_state_from_db() -> None:
+    """Hydrate session_state.scrape_state from the most recent unfinished scrape.
+
+    Called at the top of each rerun so resume works across page refreshes, OOM
+    kills, and Cloud container restarts (anything that wipes session_state).
+    """
+    if st.session_state.scrape_state:
+        return  # Already populated this rerun
+    conn = _get_db()
+    active = db.get_active_scrape(conn)
+    if not active or active["pending"] == 0:
         return
-    try:
-        with open(SCRAPE_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, default=str)
-    except Exception:
-        pass
-
-
-def _load_scrape_state_from_disk() -> dict | None:
-    try:
-        if os.path.exists(SCRAPE_STATE_FILE):
-            with open(SCRAPE_STATE_FILE, encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return None
+    sid = active["id"]
+    st.session_state.scrape_state = {
+        "id":           sid,
+        "total":        active["total"],
+        "done_count":   active["done"] + active["failed"],
+        "remaining":    db.get_remaining_urls(conn, sid),
+        "results":      db.get_results(conn, sid),
+        "failed":       db.get_failed_urls(conn, sid),
+        "source_name":  active["source_name"],
+        "skip_chinese": active["skip_chinese"],
+    }
 
 
 def _clear_scrape_state() -> None:
-    """Wipe scrape_state from both session_state and disk (after success/discard)."""
+    """Discard the active scrape (deletes its DB rows + clears session_state)."""
+    state = st.session_state.scrape_state
+    if state and state.get("id"):
+        try:
+            db.delete_scrape(_get_db(), state["id"])
+        except Exception:
+            pass
     st.session_state.scrape_state = None
-    try:
-        if os.path.exists(SCRAPE_STATE_FILE):
-            os.remove(SCRAPE_STATE_FILE)
-    except Exception:
-        pass
 
 
-# Restore scrape_state from disk on first script run (e.g., after a Cloud restart)
-if st.session_state.scrape_state is None:
-    _disk_state = _load_scrape_state_from_disk()
-    if _disk_state and _disk_state.get("remaining"):
-        st.session_state.scrape_state = _disk_state
+_refresh_scrape_state_from_db()
 
 
 def _run_scrape(urls_to_process: list[str]) -> None:
-    """Process URLs and stream results into session_state.scrape_state.
+    """Process URLs and write each result to the DB as it completes.
 
-    Saves progress to disk every 10 completions so the user can resume after a
-    crash, OOM kill, or websocket disconnect.
+    The DB is the source of truth — if the process dies mid-scrape, refreshing
+    the page brings the resume banner back with everything already done.
     """
     state = st.session_state.scrape_state
+    sid = state["id"]
     total = state["total"]
-    done_count = len(state["done"])
+    done_count = state["done_count"]
+    conn = _get_db()
 
     progress = st.progress(
         done_count / total if total else 0,
@@ -519,29 +525,25 @@ def _run_scrape(urls_to_process: list[str]) -> None:
                     r = None
                 if r:
                     state["results"].append(r)
+                    db.mark_url_done(conn, sid, u, r)
                     ticker_lines.insert(0, f"✅ **{u}** — {r['emails'][:80]}")
                 else:
                     state["failed"].append(u)
+                    db.mark_url_failed(conn, sid, u)
                     ticker_lines.insert(0, f"❌ **{u}** — no email")
-                # Move from remaining → done
                 try:
                     state["remaining"].remove(u)
                 except ValueError:
                     pass
-                state["done"].append(u)
+                done_count += 1
+                state["done_count"] = done_count
 
-                done_count = len(state["done"])
                 progress.progress(
                     done_count / total,
                     text=f"Scraping {done_count} / {total}…",
                 )
                 ticker.markdown("\n".join(ticker_lines[:15]))
-
-                if done_count % 10 == 0:
-                    _save_scrape_state()
     finally:
-        # Always save before returning — covers exceptions too
-        _save_scrape_state()
         progress.empty()
         ticker.empty()
 
@@ -578,7 +580,7 @@ st.markdown(
 _pending = st.session_state.scrape_state
 resume_clicked = False
 if _pending and _pending.get("remaining"):
-    _done_n = len(_pending["done"])
+    _done_n = _pending["done_count"]
     _total_n = _pending["total"]
     _remaining_n = len(_pending["remaining"])
     st.warning(
@@ -905,7 +907,13 @@ def _finalize_scrape() -> None:
         "source_name": source_name,
     })
     st.session_state.history = st.session_state.history[:HIST_MAX]
-    _clear_scrape_state()
+    # Mark the DB row as finished (but keep it for history browsing)
+    if state.get("id"):
+        try:
+            db.finish_scrape(_get_db(), state["id"])
+        except Exception:
+            pass
+    st.session_state.scrape_state = None
 
 
 # ── Path 1: Resume an in-flight scrape ──────────────────────────────
@@ -1014,18 +1022,18 @@ if scrape_clicked:
                 st.error("All URLs were filtered out. Untick *Skip non-commercial domains* in the sidebar to include them.")
                 st.stop()
 
-            # Initialize scrape_state and persist before the loop starts
+            # Create the DB row first — every URL completion writes back to it
+            sid = db.create_scrape(_get_db(), list(urls), source_name, bool(skip_chinese))
             st.session_state.scrape_state = {
-                "total":       len(urls),
-                "remaining":   list(urls),
-                "done":        [],
-                "results":     [],
-                "failed":      [],
-                "source_name": source_name,
+                "id":           sid,
+                "total":        len(urls),
+                "done_count":   0,
+                "remaining":    list(urls),
+                "results":      [],
+                "failed":       [],
+                "source_name":  source_name,
                 "skip_chinese": bool(skip_chinese),
-                "started_at":  datetime.now().isoformat(),
             }
-            _save_scrape_state()
 
             _run_scrape(list(urls))
 
@@ -1213,29 +1221,50 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Could not restore: {e}")
 
-    if not st.session_state.history:
+    # History is now read from the SQLite DB so it survives container restarts
+    # and is shared across browser tabs / sessions on the same instance.
+    db_history = []
+    try:
+        db_history = db.get_history(_get_db(), limit=20)
+    except Exception as exc:
+        st.caption(f"⚠ DB read failed: {exc}")
+
+    if not db_history:
         st.caption("No previous scrapes yet.")
     else:
-        for i, h in enumerate(st.session_state.history):
+        for h in db_history:
             with st.container(border=True):
+                source = h.get("source_name") or "(direct input)"
+                when_short = (h.get("started_at") or "")[:16].replace("T", " ")
+                status_html = ""
+                if not h.get("finished_at"):
+                    status_html = (
+                        " · <span style='color:#b45309'><b>unfinished</b></span>"
+                    )
                 st.markdown(
-                    f"**{h['count']}** results · "
-                    f"{('<span style=\"color:#b45309\">' + str(h['failed']) + ' skipped</span>') if h['failed'] else ''} "
-                    f"<br><small style='color:#94a3b8'>{h['when']}</small>",
+                    f"<small style='color:#1e293b'><b>{source}</b></small><br>"
+                    f"<span style='font-size:.85rem;'>"
+                    f"**{h['done']}** done · "
+                    f"{('**' + str(h['failed']) + '** failed · ') if h['failed'] else ''}"
+                    f"{('**' + str(h['pending']) + '** pending' + status_html) if h['pending'] else ''}"
+                    f"</span><br>"
+                    f"<small style='color:#94a3b8'>{when_short}</small>",
                     unsafe_allow_html=True,
                 )
                 c1, c2 = st.columns(2)
-                if c1.button("Restore", key=f"restore_{i}", use_container_width=True):
-                    st.session_state.results     = h["results"]
-                    st.session_state.failed      = h["failed_urls"]
+                if c1.button("Open", key=f"hist_open_{h['id']}", use_container_width=True):
+                    conn = _get_db()
+                    st.session_state.results     = db.get_results(conn, h["id"])
+                    st.session_state.failed      = db.get_failed_urls(conn, h["id"])
                     st.session_state.source_name = h.get("source_name")
                     st.rerun()
-                if c2.button("Delete", key=f"delete_{i}", use_container_width=True):
-                    st.session_state.history.pop(i)
+                if c2.button("Delete", key=f"hist_del_{h['id']}", use_container_width=True):
+                    db.delete_scrape(_get_db(), h["id"])
+                    # If the deleted row was the active scrape, clear the banner too
+                    if (st.session_state.scrape_state
+                        and st.session_state.scrape_state.get("id") == h["id"]):
+                        st.session_state.scrape_state = None
                     st.rerun()
-        if st.button("Clear history", type="secondary", use_container_width=True):
-            st.session_state.history = []
-            st.rerun()
 
     st.markdown("---")
     st.markdown(
