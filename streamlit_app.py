@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+import concurrent.futures  # for TimeoutError on as_completed
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urlparse
@@ -536,6 +537,32 @@ def _clear_scrape_state() -> bool:
 _refresh_scrape_state_from_db()
 
 
+def _record_url_outcome(state, conn, sid, u: str, r: dict | None, ticker_lines: list[str]) -> None:
+    """Apply one URL result to in-memory state + DB. Idempotent & exception-safe.
+
+    Extracted so the batch-timeout path can reuse the same bookkeeping for
+    URLs that didn't finish in time (marked as failed).
+    """
+    if r:
+        state["results"].append(r)
+        try:
+            db.mark_url_done(conn, sid, u, r)
+        except Exception as exc:
+            print(f"[db] mark_url_done failed for {u}: {exc}", flush=True)
+        ticker_lines.insert(0, f"✅ **{u}** — {r['emails'][:80]}")
+    else:
+        state["failed"].append(u)
+        try:
+            db.mark_url_failed(conn, sid, u)
+        except Exception as exc:
+            print(f"[db] mark_url_failed failed for {u}: {exc}", flush=True)
+        ticker_lines.insert(0, f"❌ **{u}** — no email")
+    try:
+        state["remaining"].remove(u)
+    except ValueError:
+        pass
+
+
 def _run_scrape(urls_to_process: list[str]) -> None:
     """Process URLs in small batches, writing each result to the DB as it completes.
 
@@ -573,35 +600,30 @@ def _run_scrape(urls_to_process: list[str]) -> None:
                 f"— processing {len(batch)} URL{'s' if len(batch) != 1 else ''}…"
             )
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                futures = {ex.submit(scrape_url, u): u for u in batch}
-                for f in as_completed(futures):
+            # Hard cap on how long a single batch can take. If a worker hangs
+            # (typically Playwright's browser.close() blocking on a zombie
+            # Chromium child) the as_completed iterator would otherwise wait
+            # forever and the whole scrape would stop dead — this is the
+            # actual cause of "stops at 100" with BATCH_SIZE=25 (4 × 25 = 100).
+            #
+            # 60s per URL × batch_size, clamped to 5 minutes, with a 30s floor.
+            batch_timeout_sec = max(30, min(300, 60 * len(batch)))
+
+            # NOTE: not using `with ThreadPoolExecutor` — its __exit__ calls
+            # shutdown(wait=True) which would itself block on stuck workers
+            # and re-introduce the freeze we're trying to fix. We shutdown
+            # manually with wait=False so the next batch starts immediately.
+            ex = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+            futures = {ex.submit(scrape_url, u): u for u in batch}
+            try:
+                iter_futures = as_completed(futures, timeout=batch_timeout_sec)
+                for f in iter_futures:
                     u = futures[f]
                     try:
                         r = f.result()
                     except Exception:
                         r = None
-                    if r:
-                        state["results"].append(r)
-                        # A transient SQLite error (locked file, disk pressure)
-                        # must not kill the whole scrape — the URL will be
-                        # re-processed on resume since it stays 'pending' in DB.
-                        try:
-                            db.mark_url_done(conn, sid, u, r)
-                        except Exception as exc:
-                            print(f"[db] mark_url_done failed for {u}: {exc}")
-                        ticker_lines.insert(0, f"✅ **{u}** — {r['emails'][:80]}")
-                    else:
-                        state["failed"].append(u)
-                        try:
-                            db.mark_url_failed(conn, sid, u)
-                        except Exception as exc:
-                            print(f"[db] mark_url_failed failed for {u}: {exc}")
-                        ticker_lines.insert(0, f"❌ **{u}** — no email")
-                    try:
-                        state["remaining"].remove(u)
-                    except ValueError:
-                        pass
+                    _record_url_outcome(state, conn, sid, u, r, ticker_lines)
                     done_count += 1
                     state["done_count"] = done_count
 
@@ -610,6 +632,29 @@ def _run_scrape(urls_to_process: list[str]) -> None:
                         text=f"Scraping {done_count} / {total}…",
                     )
                     ticker.markdown("\n".join(ticker_lines[:15]))
+            except concurrent.futures.TimeoutError:
+                # One or more URLs in this batch didn't finish in time.
+                # Mark them as failed-but-retryable so the scrape moves on.
+                timed_out_urls = [u for f, u in futures.items() if not f.done()]
+                print(
+                    f"[scrape] batch {batch_idx + 1} timed out after "
+                    f"{batch_timeout_sec}s · {len(timed_out_urls)} URLs hung — "
+                    f"marking as failed: {timed_out_urls[:5]}{'...' if len(timed_out_urls) > 5 else ''}",
+                    flush=True,
+                )
+                for u in timed_out_urls:
+                    _record_url_outcome(state, conn, sid, u, None, ticker_lines)
+                    done_count += 1
+                    state["done_count"] = done_count
+                progress.progress(
+                    done_count / total,
+                    text=f"Scraping {done_count} / {total}…",
+                )
+                ticker.markdown("\n".join(ticker_lines[:15]))
+            finally:
+                # Don't wait for stuck workers — they're daemon threads (in
+                # Python 3.9+) so they die with the process. We just move on.
+                ex.shutdown(wait=False, cancel_futures=True)
 
             # Between-batch cleanup: force GC, brief pause
             if batch_idx < total_batches - 1:
