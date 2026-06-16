@@ -168,6 +168,7 @@ def strip_tracking_params(url: str) -> str:
 # ── robots.txt cache (one parser per domain, fetched once) ─────────
 _robots_cache: dict[str, RobotFileParser | None] = {}
 _robots_lock = threading.Lock()
+_MISSING = object()  # sentinel — distinguishes "cached as None (=allow)" from "not yet cached"
 
 
 def _allowed_by_robots(url: str) -> bool:
@@ -183,23 +184,35 @@ def _allowed_by_robots(url: str) -> bool:
         return True
     domain_root = f"{parsed.scheme}://{parsed.netloc}"
 
+    # Cache check — quick lock around dict access ONLY. The HTTP fetch
+    # below must NOT happen inside the lock, otherwise every worker thread
+    # ends up serialized through this single lock and the whole scrape
+    # crawls (this was the actual cause of "stuck at 0/48" — see screenshot).
     with _robots_lock:
-        if domain_root not in _robots_cache:
-            rp = RobotFileParser()
-            rp.set_url(f"{domain_root}/robots.txt")
-            try:
-                resp = requests.get(
-                    f"{domain_root}/robots.txt",
-                    headers=HEADERS, timeout=5, allow_redirects=True,
-                )
-                if resp.status_code == 200 and resp.text:
-                    rp.parse(resp.text.splitlines())
-                    _robots_cache[domain_root] = rp
-                else:
-                    _robots_cache[domain_root] = None  # no robots.txt = allow
-            except Exception:
-                _robots_cache[domain_root] = None
-        rp = _robots_cache[domain_root]
+        cached = _robots_cache.get(domain_root, _MISSING)
+
+    if cached is not _MISSING:
+        rp = cached
+    else:
+        # Fetch outside the lock. Multiple workers may race to fetch the same
+        # robots.txt for the same domain — that's fine, last write wins and
+        # the result is identical anyway.
+        rp = RobotFileParser()
+        rp.set_url(f"{domain_root}/robots.txt")
+        try:
+            resp = requests.get(
+                f"{domain_root}/robots.txt",
+                headers=HEADERS, timeout=5, allow_redirects=True,
+            )
+            if resp.status_code == 200 and resp.text:
+                rp.parse(resp.text.splitlines())
+            else:
+                rp = None  # no robots.txt = allow
+        except Exception:
+            rp = None
+        # Quick lock to write the cache entry
+        with _robots_lock:
+            _robots_cache[domain_root] = rp
 
     if rp is None:
         return True
