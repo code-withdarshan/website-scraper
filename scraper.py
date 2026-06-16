@@ -264,30 +264,15 @@ def _fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> str | None:
 # DOM via JavaScript after page load. `requests` only sees the raw server HTML,
 # so the email is invisible. Playwright runs a real browser and returns the
 # DOM after JS executes. Used only when the normal pipeline finds no email.
-_render_tls = threading.local()
+#
+# Memory: Chromium uses ~300-400 MB per running instance. To avoid OOM crashes
+# on Streamlit Cloud (~1 GB free tier) when many worker threads need JS rendering
+# at once, we (a) cap concurrent renders globally with a semaphore, and
+# (b) start + stop Playwright per call so no Chromium is left running idle.
+_RENDER_SEMAPHORE = threading.Semaphore(2)  # max 2 concurrent Chromium instances
 
 
-def _get_render_browser():
-    """Lazy thread-local Playwright browser. Returns None if unavailable."""
-    if not _PLAYWRIGHT_AVAILABLE:
-        return None
-    if getattr(_render_tls, "browser", None):
-        return _render_tls.browser
-    try:
-        _render_tls.pw = _sync_playwright().start()
-        _render_tls.browser = _render_tls.pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        return _render_tls.browser
-    except Exception as exc:
-        log.warning("Playwright launch failed (JS fallback disabled): %s", exc)
-        _render_tls.browser = None
-        _render_tls.pw = None
-        return None
-
-
-def _fetch_rendered(url: str, timeout_ms: int = 15000) -> str | None:
+def _fetch_rendered(url: str, timeout_ms: int = 12000) -> str | None:
     """Fetch a URL after JavaScript executes. Returns rendered HTML or None."""
     if not _PLAYWRIGHT_AVAILABLE:
         return None
@@ -296,32 +281,42 @@ def _fetch_rendered(url: str, timeout_ms: int = 15000) -> str | None:
     url = strip_tracking_params(url)
     if not _is_safe_url(url) or not _allowed_by_robots(url):
         return None
-    browser = _get_render_browser()
-    if browser is None:
-        return None
-    ctx = None
-    try:
-        ctx = browser.new_context(
-            user_agent=BROWSER_HEADERS["User-Agent"],
-            viewport={"width": 1280, "height": 800},
-        )
-        page = ctx.new_page()
-        page.goto(url, timeout=timeout_ms, wait_until="networkidle")
-        # Best-effort wait for a mailto link to appear (footer email injection)
+
+    # Bound peak memory: at most 2 Chromiums running anywhere in the process
+    with _RENDER_SEMAPHORE:
+        pw = None
+        browser = None
         try:
-            page.wait_for_selector('a[href^="mailto:"]', timeout=2500)
-        except Exception:
-            pass
-        return page.content()
-    except Exception as exc:
-        log.debug("Rendered fetch failed for %s: %s", url, exc)
-        return None
-    finally:
-        if ctx:
+            pw = _sync_playwright().start()
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            ctx = browser.new_context(
+                user_agent=BROWSER_HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800},
+            )
+            page = ctx.new_page()
+            # `domcontentloaded` is much faster than `networkidle` (5-10x) and is
+            # enough for SPAs that inject contact info on initial hydration.
+            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            # Best-effort wait for a mailto link to appear (footer email injection)
             try:
-                ctx.close()
+                page.wait_for_selector('a[href^="mailto:"]', timeout=2500)
             except Exception:
                 pass
+            return page.content()
+        except Exception as exc:
+            log.debug("Rendered fetch failed for %s: %s", url, exc)
+            return None
+        finally:
+            # Tear down EVERYTHING so memory is freed before next call
+            if browser:
+                try: browser.close()
+                except Exception: pass
+            if pw:
+                try: pw.stop()
+                except Exception: pass
 
 
 # ── Email extraction ────────────────────────────────────────────────
