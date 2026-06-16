@@ -692,6 +692,28 @@ skip_chinese = st.sidebar.checkbox(
     help="Drops URLs ending in .cn (and .edu.cn, .gov.cn, .com.cn etc.) BEFORE scraping, "
          "and removes any result whose detected City is a known mainland-China / HK / Macao city.",
 )
+
+st.sidebar.markdown("### 🐢 Pace")
+conservative_mode = st.sidebar.checkbox(
+    "Conservative mode (recommended for large lists)",
+    value=False,
+    help="Trades speed for reliability. Cuts workers from 5 → 2, batch size "
+         "from 25 → 10, cool-down from 3s → 15s, and SKIPS JS-rendering "
+         "entirely (no Chromium). Use this when scrapes stop mid-way around "
+         "100 URLs (usually OOM on Streamlit Cloud free tier) or when you "
+         "want to scrape slowly to avoid rate-limit bans.",
+)
+# Apply the toggle by mutating module-level constants the scrape loop reads.
+# Also sets SCRAPER_SKIP_JS so scraper.py's _fetch_rendered skips Playwright.
+import os as _os
+if conservative_mode:
+    MAX_WORKERS     = 2
+    BATCH_SIZE      = 10
+    BATCH_PAUSE_SEC = 15
+    _os.environ["SCRAPER_SKIP_JS"] = "1"
+else:
+    _os.environ.pop("SCRAPER_SKIP_JS", None)
+
 st.sidebar.markdown("---")
 
 

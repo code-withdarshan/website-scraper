@@ -53,7 +53,7 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
     "Accept-Encoding": "gzip, deflate",
 }
-DEFAULT_TIMEOUT = 12
+DEFAULT_TIMEOUT = 20  # was 12 — more forgiving for slow servers
 MAX_RETRIES = 2
 
 # Extra "browser-like" headers used on the 403 retry to slip past basic Cloudflare checks
@@ -273,8 +273,16 @@ _RENDER_SEMAPHORE = threading.Semaphore(1)  # max 1 concurrent Chromium — boun
 
 
 def _fetch_rendered(url: str, timeout_ms: int = 12000) -> str | None:
-    """Fetch a URL after JavaScript executes. Returns rendered HTML or None."""
+    """Fetch a URL after JavaScript executes. Returns rendered HTML or None.
+
+    Set the env var SCRAPER_SKIP_JS=1 to disable Chromium entirely — useful when
+    memory is tight (Streamlit Cloud free tier) or you want to scrape slowly
+    without the risk of OOM kills from Chromium pressure.
+    """
     if not _PLAYWRIGHT_AVAILABLE:
+        return None
+    import os
+    if os.environ.get("SCRAPER_SKIP_JS") == "1":
         return None
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
