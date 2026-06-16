@@ -10,6 +10,12 @@ font = "sans serif"
 maxUploadSize = 10
 runOnSave = false
 headless = true
+# Disable the file watcher entirely. Without this, Streamlit watches every
+# file in the project dir and reacts to modifications. On OneDrive-synced
+# folders (and any setup where SQLite WAL files keep ticking), the watcher
+# triggers a reload loop. runOnSave already says "don't rerun on changes",
+# but the watcher itself still imposes overhead and can cause spurious reloads.
+fileWatcherType = "none"
 
 [browser]
 gatherUsageStats = false

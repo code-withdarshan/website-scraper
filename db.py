@@ -6,16 +6,67 @@ URL-level granularity is what lets the user resume after a crash, an internet
 drop, or a Streamlit Cloud process restart.
 
 Schema is created lazily on first connect.
+
+DB location:
+  • By default the DB lives OUTSIDE the project tree so cloud-synced folders
+    (OneDrive, Dropbox, iCloud) and IDE file watchers don't get triggered by
+    the constantly-changing SQLite WAL files.
+  - On Linux/macOS:  ~/.scraper/scraper.db
+  - On Windows:      LOCALAPPDATA/scraper/scraper.db (falls back to ~)
+  - Override with the SCRAPER_DB env var (used by Streamlit Cloud where /tmp
+    is preferred, or for tests).
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "scraper.db"
+
+def _default_db_path() -> Path:
+    """Return a stable per-user DB path outside the project tree."""
+    override = os.environ.get("SCRAPER_DB")
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "scraper" / "scraper.db"
+    return Path.home() / ".scraper" / "scraper.db"
+
+
+DB_PATH = _default_db_path()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _migrate_legacy_db() -> None:
+    """One-time copy of an old project-dir scraper.db into the new location.
+
+    Earlier versions put the DB in the project root. If the user has scrape
+    history there, copy it over to the new stable path so they don't lose it.
+    Idempotent: only runs if new path is empty and old path exists.
+    """
+    legacy = Path(__file__).parent / "scraper.db"
+    if not legacy.exists():
+        return
+    if DB_PATH.exists() and DB_PATH.stat().st_size > 0:
+        return
+    try:
+        import shutil
+        shutil.copy2(legacy, DB_PATH)
+        for suffix in ("-wal", "-shm"):
+            extra = legacy.with_name(legacy.name + suffix)
+            if extra.exists():
+                shutil.copy2(extra, DB_PATH.with_name(DB_PATH.name + suffix))
+    except Exception:
+        pass
+
+
+_migrate_legacy_db()
 
 _lock = threading.Lock()
 
