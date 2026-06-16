@@ -272,18 +272,162 @@ def _fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> str | None:
 _RENDER_SEMAPHORE = threading.Semaphore(1)  # max 1 concurrent Chromium — bounds peak memory
 
 
+def _scraper_chrome_profile_dir():
+    """Return path to the dedicated scraper Chrome profile. Created on first use."""
+    import os
+    from pathlib import Path
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if base:
+        profile = Path(base) / "scraper-chrome-profile"
+    else:
+        profile = Path.home() / ".scraper-chrome-profile"
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile
+
+
+def _is_captcha_challenge(page) -> bool:
+    """Detect whether the page is currently blocked by a CAPTCHA / challenge.
+
+    Tries to distinguish "this page HAS a reCAPTCHA somewhere" (e.g. on a
+    contact form) from "this page IS a CAPTCHA challenge blocking content".
+    """
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+    challenge_titles = (
+        "just a moment", "attention required", "verify you are human",
+        "checking your browser", "cloudflare", "access denied",
+        "please verify you are a human",
+    )
+    if any(kw in title for kw in challenge_titles):
+        return True
+    # Cloudflare / Turnstile / generic challenge containers
+    blocking_selectors = (
+        "#challenge-form", ".challenge-form", ".cf-challenge",
+        ".cf-browser-verification", "#cf-challenge-running",
+        "iframe[src*='challenges.cloudflare.com']",
+    )
+    for sel in blocking_selectors:
+        try:
+            if page.query_selector(sel):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _wait_for_captcha_solved(page, timeout_sec: int = 90) -> bool:
+    """If a CAPTCHA is blocking the page, inject a banner and poll until solved.
+
+    Returns True if the page is clear (no CAPTCHA), False on timeout.
+    Only used in Local-Chrome mode where the user can see and solve it.
+    """
+    if not _is_captcha_challenge(page):
+        return True  # No CAPTCHA, proceed
+    log.info("CAPTCHA detected on %s — waiting up to %ss for manual solving", page.url, timeout_sec)
+    # Inject a visible banner so the user knows the scraper is waiting
+    try:
+        page.evaluate(
+            """
+            (() => {
+              if (document.getElementById('__scraper_wait_banner')) return;
+              const d = document.createElement('div');
+              d.id = '__scraper_wait_banner';
+              d.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#fbbf24;color:#000;padding:14px;text-align:center;font:bold 16px system-ui,sans-serif;z-index:2147483647;box-shadow:0 2px 8px rgba(0,0,0,.3)';
+              d.textContent = 'Scraper paused — please solve the CAPTCHA below. Scraping will continue automatically once the real page loads.';
+              document.body.appendChild(d);
+            })();
+            """
+        )
+    except Exception:
+        pass
+    # Poll every 2s until the challenge is gone
+    elapsed = 0
+    while elapsed < timeout_sec:
+        time.sleep(2)
+        elapsed += 2
+        try:
+            if not _is_captcha_challenge(page):
+                log.info("CAPTCHA cleared after %ss on %s", elapsed, page.url)
+                return True
+        except Exception:
+            # Page may have navigated; assume clear
+            return True
+    log.warning("CAPTCHA still present after %ss — giving up on %s", timeout_sec, page.url)
+    return False
+
+
+def _fetch_rendered_local_chrome(url: str, timeout_ms: int = 90000) -> str | None:
+    """Open URL in a visible Chrome window using a persistent profile.
+
+    The dedicated profile means the user can log into Google (or anywhere
+    else) once, and their session persists across scrapes. Used when the
+    SCRAPER_LOCAL_CHROME=1 env var is set. Falls back gracefully if Chrome
+    or Playwright can't launch — returns None.
+    """
+    if not _PLAYWRIGHT_AVAILABLE:
+        return None
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    url = strip_tracking_params(url)
+    if not _is_safe_url(url) or not _allowed_by_robots(url):
+        return None
+    with _RENDER_SEMAPHORE:
+        pw = None
+        ctx = None
+        try:
+            pw = _sync_playwright().start()
+            profile_dir = str(_scraper_chrome_profile_dir())
+            launch_kwargs = dict(
+                user_data_dir=profile_dir,
+                headless=False,
+                args=["--no-default-browser-check", "--no-first-run", "--disable-blink-features=AutomationControlled"],
+            )
+            # Prefer the user's installed Chrome (more authentic fingerprint than
+            # bundled Chromium). Fall back to Chromium if Chrome isn't installed.
+            try:
+                ctx = pw.chromium.launch_persistent_context(channel="chrome", **launch_kwargs)
+            except Exception:
+                ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto(url, timeout=timeout_ms, wait_until="load")
+            # If a CAPTCHA is blocking, give the user 90s to solve it manually
+            _wait_for_captcha_solved(page, timeout_sec=90)
+            # Now wait briefly for mailto links (post-CAPTCHA hydration)
+            try:
+                page.wait_for_selector('a[href^="mailto:"]', timeout=3000)
+            except Exception:
+                pass
+            return page.content()
+        except Exception as exc:
+            log.debug("Local Chrome render failed for %s: %s", url, exc)
+            return None
+        finally:
+            if ctx:
+                try: ctx.close()
+                except Exception: pass
+            if pw:
+                try: pw.stop()
+                except Exception: pass
+
+
 def _fetch_rendered(url: str, timeout_ms: int = 12000) -> str | None:
     """Fetch a URL after JavaScript executes. Returns rendered HTML or None.
 
-    Set the env var SCRAPER_SKIP_JS=1 to disable Chromium entirely — useful when
-    memory is tight (Streamlit Cloud free tier) or you want to scrape slowly
-    without the risk of OOM kills from Chromium pressure.
+    Env-var controls:
+      - SCRAPER_SKIP_JS=1     → skip JS rendering entirely (Conservative mode).
+      - SCRAPER_LOCAL_CHROME=1 → use a visible local Chrome with a persistent
+        profile (Local Chrome mode) so the user can log in once and solve any
+        CAPTCHAs manually. Local-only feature.
     """
     if not _PLAYWRIGHT_AVAILABLE:
         return None
     import os
     if os.environ.get("SCRAPER_SKIP_JS") == "1":
         return None
+    if os.environ.get("SCRAPER_LOCAL_CHROME") == "1":
+        return _fetch_rendered_local_chrome(url, timeout_ms=90000)
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     url = strip_tracking_params(url)

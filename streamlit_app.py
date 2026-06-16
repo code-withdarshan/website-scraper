@@ -781,24 +781,49 @@ skip_chinese = st.sidebar.checkbox(
 )
 
 st.sidebar.markdown("### 🐢 Pace")
+local_chrome_mode = st.sidebar.checkbox(
+    "Use my local Chrome (visible, with login)",
+    value=False,
+    help="LOCAL ONLY — won't work on Streamlit Cloud. Opens a real Chrome "
+         "window using a dedicated profile at %LOCALAPPDATA%/scraper-chrome-profile. "
+         "Log in once (Google etc.) and your session persists across runs. "
+         "If a CAPTCHA appears, the scrape pauses up to 90s per URL — solve "
+         "it in the window and scraping continues automatically. Forces 1 "
+         "worker (sequential) so you only deal with one CAPTCHA at a time.",
+)
 conservative_mode = st.sidebar.checkbox(
     "Conservative mode (recommended for large lists)",
     value=False,
+    disabled=local_chrome_mode,
     help="Trades speed for reliability. Cuts workers from 5 → 2, batch size "
          "from 25 → 10, cool-down from 3s → 15s, and SKIPS JS-rendering "
          "entirely (no Chromium). Use this when scrapes stop mid-way around "
          "100 URLs (usually OOM on Streamlit Cloud free tier) or when you "
-         "want to scrape slowly to avoid rate-limit bans.",
+         "want to scrape slowly to avoid rate-limit bans. Disabled when "
+         "Local Chrome mode is on (they conflict).",
 )
-# Apply the toggle by mutating module-level constants the scrape loop reads.
-# Also sets SCRAPER_SKIP_JS so scraper.py's _fetch_rendered skips Playwright.
-if conservative_mode:
+# Local Chrome mode takes precedence — it needs JS rendering and a visible browser.
+if local_chrome_mode:
+    MAX_WORKERS     = 1   # sequential — one CAPTCHA at a time
+    BATCH_SIZE      = 5   # small batches so the user sees progress steadily
+    BATCH_PAUSE_SEC = 2
+    os.environ["SCRAPER_LOCAL_CHROME"] = "1"
+    os.environ.pop("SCRAPER_SKIP_JS", None)
+    st.sidebar.info(
+        "🌐 **Local Chrome mode is ON.** A Chrome window will open during "
+        "the scrape. If a CAPTCHA appears, solve it in the window — "
+        "scraping resumes automatically. Profile lives at "
+        "`%LOCALAPPDATA%/scraper-chrome-profile`."
+    )
+elif conservative_mode:
     MAX_WORKERS     = 2
     BATCH_SIZE      = 10
     BATCH_PAUSE_SEC = 15
     os.environ["SCRAPER_SKIP_JS"] = "1"
+    os.environ.pop("SCRAPER_LOCAL_CHROME", None)
 else:
     os.environ.pop("SCRAPER_SKIP_JS", None)
+    os.environ.pop("SCRAPER_LOCAL_CHROME", None)
 
 st.sidebar.markdown("---")
 
