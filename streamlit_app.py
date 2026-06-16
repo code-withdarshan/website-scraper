@@ -606,6 +606,60 @@ def _run_scrape(urls_to_process: list[str]) -> None:
         ticker.empty()
 
 
+def _finalize_scrape() -> None:
+    """Called once the scrape_state has no remaining URLs — applies post-processing,
+    moves results to session_state.results, saves history, and clears scrape_state.
+
+    Defined here (not at the bottom of the script) so it's available to the
+    resume banner block, which now executes the scrape inline."""
+    state = st.session_state.scrape_state
+    if not state:
+        return
+    results = list(state["results"])
+    failed  = list(state["failed"])
+    source_name = state.get("source_name")
+    skip_chinese_flag = state.get("skip_chinese", False)
+
+    if skip_chinese_flag:
+        before_n = len(results)
+        results = [r for r in results if not _is_chinese_city(r.get("city", ""))]
+        dropped = before_n - len(results)
+        if dropped:
+            st.info(
+                f"🇨🇳 Dropped **{dropped}** result"
+                f"{'s' if dropped != 1 else ''} after scraping — city detected "
+                "as mainland China / Hong Kong / Macao."
+            )
+
+    results = _sort_gmail_first(results)
+    gmail_count = sum(1 for r in results if _has_gmail(r))
+    if gmail_count:
+        st.success(
+            f"✉️ {gmail_count} site{'s' if gmail_count != 1 else ''} "
+            f"with Gmail address{'es' if gmail_count != 1 else ''} sorted to the top."
+        )
+
+    st.session_state.results = results
+    st.session_state.failed  = failed
+    st.session_state.source_name = source_name
+    _bump_counter()
+    st.session_state.history.insert(0, {
+        "when":        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "count":       len(results),
+        "failed":      len(failed),
+        "results":     results,
+        "failed_urls": failed,
+        "source_name": source_name,
+    })
+    st.session_state.history = st.session_state.history[:HIST_MAX]
+    if state.get("id"):
+        try:
+            db.finish_scrape(_get_db(), state["id"])
+        except Exception:
+            pass
+    st.session_state.scrape_state = None
+
+
 # ── Sidebar filter (defined early so it's available before scrape logic) ──
 st.sidebar.markdown("### ⚙️ Filters")
 skip_noncommercial = st.sidebar.checkbox(
@@ -636,7 +690,6 @@ st.markdown(
 
 # ── Resume banner (only shown when an unfinished scrape exists) ────
 _pending = st.session_state.scrape_state
-resume_clicked = False
 if _pending and _pending.get("remaining"):
     _done_n = _pending["done_count"]
     _total_n = _pending["total"]
@@ -649,7 +702,7 @@ if _pending and _pending.get("remaining"):
     )
     rc1, rc2, rc3, _ = st.columns([1.2, 1.4, 1.1, 4.3])
     with rc1:
-        resume_clicked = st.button(
+        _resume_clicked = st.button(
             "▶️ Resume scrape",
             type="primary",
             use_container_width=True,
@@ -669,6 +722,23 @@ if _pending and _pending.get("remaining"):
         if st.button("🗑 Discard", use_container_width=True, key="discard_btn"):
             _clear_scrape_state()
             st.rerun()
+
+    # If the user clicked Resume, run the scrape RIGHT HERE so the progress
+    # bar and ticker appear directly under the banner — not far below at the
+    # bottom of the page where the user might not see them. st.stop() prevents
+    # the rest of the page (input tabs, scrape button, etc.) from rendering
+    # during the run so the user's attention stays on the progress.
+    if _resume_clicked:
+        remaining = list(_pending["remaining"])
+        if remaining:
+            st.session_state.source_name = _pending.get("source_name")
+            st.markdown("---")
+            _run_scrape(remaining)
+            if not st.session_state.scrape_state["remaining"]:
+                _finalize_scrape()
+                st.rerun()
+        st.stop()
+
     st.markdown("---")
 
 
@@ -922,182 +992,128 @@ with col_a:
 
 
 # ── Scrape ─────────────────────────────────────────────────────────
-def _finalize_scrape() -> None:
-    """Called once the scrape_state has no remaining URLs — applies post-processing,
-    moves results to session_state.results, saves history, and clears scrape_state."""
-    state = st.session_state.scrape_state
-    if not state:
-        return
-    results = list(state["results"])
-    failed  = list(state["failed"])
-    source_name = state.get("source_name")
-    skip_chinese_flag = state.get("skip_chinese", False)
+# Note: _finalize_scrape is defined further up (near _run_scrape) so the
+# resume banner can call it inline. The Resume path is also handled there —
+# this section only handles a fresh scrape from the input form.
 
-    if skip_chinese_flag:
-        before_n = len(results)
-        results = [r for r in results if not _is_chinese_city(r.get("city", ""))]
-        dropped = before_n - len(results)
-        if dropped:
-            st.info(
-                f"🇨🇳 Dropped **{dropped}** result"
-                f"{'s' if dropped != 1 else ''} after scraping — city detected "
-                "as mainland China / Hong Kong / Macao."
-            )
-
-    results = _sort_gmail_first(results)
-    gmail_count = sum(1 for r in results if _has_gmail(r))
-    if gmail_count:
-        st.success(
-            f"✉️ {gmail_count} site{'s' if gmail_count != 1 else ''} "
-            f"with Gmail address{'es' if gmail_count != 1 else ''} sorted to the top."
+# Fresh scrape from input
+if scrape_clicked:
+    # If an unfinished scrape exists, the user clicked Scrape with fresh input
+    # — they're asking for a new scrape, not a resume. Discard the old one
+    # (the explicit way to continue is the Resume button in the banner).
+    if st.session_state.scrape_state and st.session_state.scrape_state.get("remaining"):
+        _dropped = len(st.session_state.scrape_state["remaining"])
+        _clear_scrape_state()
+        st.info(
+            f"ℹ️ Discarded the previous unfinished scrape ({_dropped} URL"
+            f"{'s' if _dropped != 1 else ''} not completed). "
+            "Use **Resume scrape** next time to continue it instead."
         )
 
-    st.session_state.results = results
-    st.session_state.failed  = failed
-    st.session_state.source_name = source_name
-    _bump_counter()
-    st.session_state.history.insert(0, {
-        "when":        datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "count":       len(results),
-        "failed":      len(failed),
-        "results":     results,
-        "failed_urls": failed,
-        "source_name": source_name,
-    })
-    st.session_state.history = st.session_state.history[:HIST_MAX]
-    # Mark the DB row as finished (but keep it for history browsing)
-    if state.get("id"):
-        try:
-            db.finish_scrape(_get_db(), state["id"])
-        except Exception:
-            pass
-    st.session_state.scrape_state = None
+    raw_urls, err, source_name = _collect_urls(text_input, uploaded_file)
+    # Surface any Google Sheet failures from the most recent _collect_urls call
+    if _LAST_FAILED_SHEETS:
+        st.warning(
+            f"⚠️ {len(_LAST_FAILED_SHEETS)} Google Sheet link"
+            f"{'s' if len(_LAST_FAILED_SHEETS) != 1 else ''} could not be downloaded "
+            "(skipped). Make sure each is shared as 'Anyone with the link can view'."
+        )
+    if err:
+        st.error(err)
+    elif not raw_urls:
+        st.error("No URLs detected in your input.")
+    else:
+        st.session_state.source_name = source_name
+        # ── Dedup + cap ──────────────────────────────────────────
+        # Normalize for dedup (treat www / non-www / trailing slash as same)
+        seen: dict[str, str] = {}
+        for u in raw_urls:
+            key = _normalize_url(u)
+            seen.setdefault(key, u)
+        urls = list(seen.values())
 
+        dupes = len(raw_urls) - len(urls)
 
-# ── Path 1: Resume an in-flight scrape ──────────────────────────────
-if resume_clicked and st.session_state.scrape_state:
-    remaining = list(st.session_state.scrape_state["remaining"])
-    if remaining:
-        st.session_state.source_name = st.session_state.scrape_state.get("source_name")
-        _run_scrape(remaining)
+        # ── Filter out .gov / .edu / .org / .ac if toggle is on ─
+        skipped_tld: list[tuple[str, str]] = []
+        if skip_noncommercial:
+            kept = []
+            for u in urls:
+                tld = _matched_skip_tld(u)
+                if tld:
+                    skipped_tld.append((u, tld))
+                else:
+                    kept.append(u)
+            urls = kept
+
+        # ── Filter out Chinese URLs (.cn variants) if toggle is on ─
+        skipped_chinese_urls: list[str] = []
+        if skip_chinese:
+            kept = []
+            for u in urls:
+                if _is_chinese_url(u):
+                    skipped_chinese_urls.append(u)
+                else:
+                    kept.append(u)
+            urls = kept
+
+        capped = 0
+        if MAX_URLS and len(urls) > MAX_URLS:
+            capped = len(urls) - MAX_URLS
+            urls = urls[:MAX_URLS]
+
+        # ── Pre-flight info banners ─────────────────────────────
+        # Build the list of side-banner messages dynamically
+        warning_msgs = []
+        if dupes:
+            warning_msgs.append(f"**{dupes}** duplicate{'s' if dupes != 1 else ''} removed")
+        if skipped_tld:
+            # Group by TLD for a clean summary
+            by_tld: dict[str, int] = {}
+            for _, t in skipped_tld:
+                by_tld[t] = by_tld.get(t, 0) + 1
+            tld_summary = ", ".join(f"{n} `{t}`" for t, n in sorted(by_tld.items()))
+            warning_msgs.append(f"**{len(skipped_tld)}** non-commercial skipped ({tld_summary})")
+        if skipped_chinese_urls:
+            warning_msgs.append(f"**{len(skipped_chinese_urls)}** Chinese `.cn` skipped")
+        if capped:
+            warning_msgs.append(f"**{capped}** truncated (max {MAX_URLS})")
+
+        info_cols = st.columns(3 if warning_msgs else 2)
+        with info_cols[0]:
+            st.info(f"📋 **{len(urls)}** unique URL{'s' if len(urls) != 1 else ''} to scrape")
+        secs, domains = _estimate_time(urls)
+        with info_cols[1]:
+            mins = secs // 60
+            time_str = f"~{mins}m {secs % 60}s" if mins else f"~{secs}s"
+            st.info(f"⏱️ Estimated time: **{time_str}** across {domains} domain{'s' if domains != 1 else ''}")
+        if warning_msgs:
+            with info_cols[2]:
+                st.warning("ℹ️ " + " · ".join(warning_msgs))
+
+        # If filtering left us with nothing, stop here
+        if not urls:
+            st.error("All URLs were filtered out. Untick *Skip non-commercial domains* in the sidebar to include them.")
+            st.stop()
+
+        # Create the DB row first — every URL completion writes back to it
+        sid = db.create_scrape(_get_db(), list(urls), source_name, bool(skip_chinese))
+        st.session_state.scrape_state = {
+            "id":           sid,
+            "total":        len(urls),
+            "done_count":   0,
+            "remaining":    list(urls),
+            "results":      [],
+            "failed":       [],
+            "source_name":  source_name,
+            "skip_chinese": bool(skip_chinese),
+        }
+
+        _run_scrape(list(urls))
+
         if not st.session_state.scrape_state["remaining"]:
             _finalize_scrape()
             st.rerun()
-
-
-# ── Path 2: Fresh scrape from input ─────────────────────────────────
-if scrape_clicked:
-    # If there's an unfinished scrape, warn the user — don't silently overwrite
-    if st.session_state.scrape_state and st.session_state.scrape_state.get("remaining"):
-        st.error(
-            "There is an unfinished scrape above. Click **Resume scrape** to "
-            "continue, or **Discard** to start a new one."
-        )
-    else:
-        raw_urls, err, source_name = _collect_urls(text_input, uploaded_file)
-        # Surface any Google Sheet failures from the most recent _collect_urls call
-        if _LAST_FAILED_SHEETS:
-            st.warning(
-                f"⚠️ {len(_LAST_FAILED_SHEETS)} Google Sheet link"
-                f"{'s' if len(_LAST_FAILED_SHEETS) != 1 else ''} could not be downloaded "
-                "(skipped). Make sure each is shared as 'Anyone with the link can view'."
-            )
-        if err:
-            st.error(err)
-        elif not raw_urls:
-            st.error("No URLs detected in your input.")
-        else:
-            st.session_state.source_name = source_name
-            # ── Dedup + cap ──────────────────────────────────────────
-            # Normalize for dedup (treat www / non-www / trailing slash as same)
-            seen: dict[str, str] = {}
-            for u in raw_urls:
-                key = _normalize_url(u)
-                seen.setdefault(key, u)
-            urls = list(seen.values())
-
-            dupes = len(raw_urls) - len(urls)
-
-            # ── Filter out .gov / .edu / .org / .ac if toggle is on ─
-            skipped_tld: list[tuple[str, str]] = []
-            if skip_noncommercial:
-                kept = []
-                for u in urls:
-                    tld = _matched_skip_tld(u)
-                    if tld:
-                        skipped_tld.append((u, tld))
-                    else:
-                        kept.append(u)
-                urls = kept
-
-            # ── Filter out Chinese URLs (.cn variants) if toggle is on ─
-            skipped_chinese_urls: list[str] = []
-            if skip_chinese:
-                kept = []
-                for u in urls:
-                    if _is_chinese_url(u):
-                        skipped_chinese_urls.append(u)
-                    else:
-                        kept.append(u)
-                urls = kept
-
-            capped = 0
-            if MAX_URLS and len(urls) > MAX_URLS:
-                capped = len(urls) - MAX_URLS
-                urls = urls[:MAX_URLS]
-
-            # ── Pre-flight info banners ─────────────────────────────
-            # Build the list of side-banner messages dynamically
-            warning_msgs = []
-            if dupes:
-                warning_msgs.append(f"**{dupes}** duplicate{'s' if dupes != 1 else ''} removed")
-            if skipped_tld:
-                # Group by TLD for a clean summary
-                by_tld: dict[str, int] = {}
-                for _, t in skipped_tld:
-                    by_tld[t] = by_tld.get(t, 0) + 1
-                tld_summary = ", ".join(f"{n} `{t}`" for t, n in sorted(by_tld.items()))
-                warning_msgs.append(f"**{len(skipped_tld)}** non-commercial skipped ({tld_summary})")
-            if skipped_chinese_urls:
-                warning_msgs.append(f"**{len(skipped_chinese_urls)}** Chinese `.cn` skipped")
-            if capped:
-                warning_msgs.append(f"**{capped}** truncated (max {MAX_URLS})")
-
-            info_cols = st.columns(3 if warning_msgs else 2)
-            with info_cols[0]:
-                st.info(f"📋 **{len(urls)}** unique URL{'s' if len(urls) != 1 else ''} to scrape")
-            secs, domains = _estimate_time(urls)
-            with info_cols[1]:
-                mins = secs // 60
-                time_str = f"~{mins}m {secs % 60}s" if mins else f"~{secs}s"
-                st.info(f"⏱️ Estimated time: **{time_str}** across {domains} domain{'s' if domains != 1 else ''}")
-            if warning_msgs:
-                with info_cols[2]:
-                    st.warning("ℹ️ " + " · ".join(warning_msgs))
-
-            # If filtering left us with nothing, stop here
-            if not urls:
-                st.error("All URLs were filtered out. Untick *Skip non-commercial domains* in the sidebar to include them.")
-                st.stop()
-
-            # Create the DB row first — every URL completion writes back to it
-            sid = db.create_scrape(_get_db(), list(urls), source_name, bool(skip_chinese))
-            st.session_state.scrape_state = {
-                "id":           sid,
-                "total":        len(urls),
-                "done_count":   0,
-                "remaining":    list(urls),
-                "results":      [],
-                "failed":       [],
-                "source_name":  source_name,
-                "skip_chinese": bool(skip_chinese),
-            }
-
-            _run_scrape(list(urls))
-
-            if not st.session_state.scrape_state["remaining"]:
-                _finalize_scrape()
-                st.rerun()
 
 
 # ── Results ────────────────────────────────────────────────────────
