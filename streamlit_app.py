@@ -824,6 +824,23 @@ skip_chinese = st.sidebar.checkbox(
     help="Drops URLs ending in .cn (and .edu.cn, .gov.cn, .com.cn etc.) BEFORE scraping, "
          "and removes any result whose detected City is a known mainland-China / HK / Macao city.",
 )
+ignore_robots = st.sidebar.checkbox(
+    "Ignore robots.txt",
+    value=False,
+    help="When ON, the scraper fetches every URL even if its robots.txt says "
+         "Disallow. Many sites (e.g. new Shopify stores) ship with a default "
+         "robots.txt that blocks all bots — this toggle lets you scrape them "
+         "anyway. Use responsibly: you're overriding the site owner's stated "
+         "preference, which can carry legal/ethical risk in some jurisdictions.",
+)
+if ignore_robots:
+    os.environ["SCRAPER_IGNORE_ROBOTS"] = "1"
+    st.sidebar.caption(
+        "⚠️ robots.txt is being **ignored**. Sites will be fetched even if they "
+        "explicitly block crawlers."
+    )
+else:
+    os.environ.pop("SCRAPER_IGNORE_ROBOTS", None)
 
 st.sidebar.markdown("### 🐢 Pace")
 local_chrome_mode = st.sidebar.checkbox(

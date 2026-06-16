@@ -171,7 +171,13 @@ _robots_lock = threading.Lock()
 
 
 def _allowed_by_robots(url: str) -> bool:
-    """Return True if robots.txt allows fetching this URL with our UA."""
+    """Return True if robots.txt allows fetching this URL with our UA.
+
+    Set SCRAPER_IGNORE_ROBOTS=1 to bypass the robots.txt check entirely.
+    """
+    import os
+    if os.environ.get("SCRAPER_IGNORE_ROBOTS") == "1":
+        return True
     parsed = urlparse(url)
     if not parsed.netloc:
         return True
