@@ -978,6 +978,20 @@ if ai_enabled:
         help="Llama 3.3 70B is a good default. 8B is fastest. Nemotron tuned by NVIDIA.",
     )
     ai_model = dict(ai_niche.MODELS)[model_label]
+
+    # Test-connection button — verify the key+model BEFORE running a real scrape
+    if st.sidebar.button("🔌 Test connection", use_container_width=True, key="ai_test_btn"):
+        with st.sidebar:
+            with st.spinner("Calling NVIDIA Build…"):
+                result = ai_niche.test_connection(ai_api_key, ai_model)
+        if result["ok"]:
+            st.sidebar.success(
+                f"✅ {result['message']}"
+                + (f"\n\nModel reply: `{result['model_reply']}`" if result["model_reply"] else "")
+            )
+        else:
+            st.sidebar.error(f"❌ {result['message']}")
+
     if not ai_api_key or not ai_api_key.startswith("nvapi-"):
         st.sidebar.caption("⚠ Paste a valid `nvapi-...` key to enable AI niche checks.")
 

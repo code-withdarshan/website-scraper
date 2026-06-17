@@ -129,6 +129,89 @@ def classify_niche(api_key: str, model: str, record: dict, timeout: int = 30) ->
     }
 
 
+def test_connection(api_key: str, model: str, timeout: int = 15) -> dict:
+    """Make a tiny test call to verify the key + model are reachable.
+
+    Returns a dict: {"ok": bool, "message": str, "latency_ms": int, "model_reply": str}.
+    The caller (UI) shows the message verbatim, so it's written for human eyes.
+    """
+    import time
+    if not api_key:
+        return {"ok": False, "message": "No API key provided.", "latency_ms": 0, "model_reply": ""}
+    if not api_key.startswith("nvapi-"):
+        return {"ok": False, "message": "Key doesn't start with 'nvapi-' — copy it again from build.nvidia.com.", "latency_ms": 0, "model_reply": ""}
+    if not model:
+        return {"ok": False, "message": "No model selected.", "latency_ms": 0, "model_reply": ""}
+
+    start = time.time()
+    try:
+        resp = requests.post(
+            f"{NVIDIA_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+                "Accept":        "application/json",
+            },
+            json={
+                "model":    model,
+                "messages": [
+                    {"role": "system", "content": "Reply with exactly the single word: OK"},
+                    {"role": "user",   "content": "ping"},
+                ],
+                "max_tokens":  5,
+                "temperature": 0.0,
+            },
+            timeout=timeout,
+        )
+    except requests.Timeout:
+        return {
+            "ok": False,
+            "message": f"Timed out after {timeout}s — network is blocking the call to integrate.api.nvidia.com.",
+            "latency_ms": int((time.time() - start) * 1000),
+            "model_reply": "",
+        }
+    except requests.ConnectionError as exc:
+        return {
+            "ok": False,
+            "message": f"Could not connect to integrate.api.nvidia.com — {exc.__class__.__name__}. Check your network/firewall.",
+            "latency_ms": int((time.time() - start) * 1000),
+            "model_reply": "",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "message": f"Request failed: {exc.__class__.__name__}: {exc}",
+            "latency_ms": int((time.time() - start) * 1000),
+            "model_reply": "",
+        }
+
+    latency_ms = int((time.time() - start) * 1000)
+    if resp.status_code == 401:
+        return {"ok": False, "message": "401 Unauthorized — the API key is invalid or expired. Regenerate it on build.nvidia.com.", "latency_ms": latency_ms, "model_reply": ""}
+    if resp.status_code == 403:
+        return {"ok": False, "message": "403 Forbidden — the key exists but doesn't have access to this model. Try a different model or check your NVIDIA Build account.", "latency_ms": latency_ms, "model_reply": ""}
+    if resp.status_code == 404:
+        return {"ok": False, "message": f"404 Not Found — model '{model}' isn't available on your account. Try a different model from the dropdown.", "latency_ms": latency_ms, "model_reply": ""}
+    if resp.status_code == 429:
+        return {"ok": False, "message": "429 Rate Limited — too many requests. Wait a moment and try again.", "latency_ms": latency_ms, "model_reply": ""}
+    if resp.status_code >= 500:
+        return {"ok": False, "message": f"{resp.status_code} server error from NVIDIA — try again in a minute.", "latency_ms": latency_ms, "model_reply": ""}
+    if not resp.ok:
+        return {"ok": False, "message": f"HTTP {resp.status_code}: {resp.text[:200]}", "latency_ms": latency_ms, "model_reply": ""}
+
+    try:
+        reply = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        return {"ok": False, "message": f"Got HTTP 200 but couldn't parse the reply ({exc}). Response: {resp.text[:200]}", "latency_ms": latency_ms, "model_reply": ""}
+
+    return {
+        "ok": True,
+        "message": f"Connected. Model replied in {latency_ms} ms.",
+        "latency_ms": latency_ms,
+        "model_reply": reply[:80],
+    }
+
+
 def classify_niches_parallel(
     api_key: str,
     model: str,
