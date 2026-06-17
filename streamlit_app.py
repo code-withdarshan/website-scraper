@@ -31,6 +31,7 @@ import streamlit as st
 import xlrd
 
 import db
+import ai_niche
 from scraper import scrape_url, strip_tracking_params
 
 
@@ -565,6 +566,52 @@ def _record_url_outcome(state, conn, sid, u: str, r: dict | None, ticker_lines: 
         pass
 
 
+def _maybe_enrich_batch_with_ai(state, conn, sid, batch_urls, ticker_lines, ticker) -> None:
+    """If AI niche verification is on, classify this batch's results and persist.
+
+    Reads the sidebar state (ai_enabled, ai_api_key, ai_model) from session_state
+    so this helper doesn't need them passed through every call site.
+    """
+    if not st.session_state.get("ai_enabled_runtime"):
+        return
+    api_key = st.session_state.get("ai_api_key", "")
+    model   = st.session_state.get("ai_model_runtime", "")
+    if not api_key or not api_key.startswith("nvapi-") or not model:
+        return
+
+    # Find results from THIS batch (URL was in the batch list AND succeeded)
+    batch_results = [r for r in state["results"] if r.get("url") in {_url_hostpart(u) for u in batch_urls}]
+    # Skip ones already classified (idempotent across resumes)
+    pending = [r for r in batch_results if not r.get("ai_niche")]
+    if not pending:
+        return
+
+    ai_results = ai_niche.classify_niches_parallel(api_key, model, pending, max_workers=3)
+    for rec, ai_out in zip(pending, ai_results):
+        if not ai_out or not ai_out.get("niche"):
+            continue
+        rec["ai_niche"]      = ai_out["niche"]
+        rec["ai_confidence"] = ai_out.get("confidence", 0)
+        rec["ai_reasoning"]  = ai_out.get("reasoning", "")
+        ticker_lines.insert(0, f"🤖 **{rec['url']}** — AI: {ai_out['niche']} (conf {ai_out.get('confidence', 0)}/5)")
+        # Persist updated result back to DB so it survives a refresh
+        try:
+            db.mark_url_done(conn, sid, rec["url"], rec)
+        except Exception as exc:
+            print(f"[db] AI-niche update failed for {rec['url']}: {exc}", flush=True)
+    ticker.markdown("\n".join(ticker_lines[:15]))
+
+
+def _url_hostpart(url: str) -> str:
+    """Mirror scraper's `urlparse(base_url).netloc or raw` logic."""
+    from urllib.parse import urlparse
+    u = url.strip() if url else ""
+    if not u:
+        return ""
+    full = u if u.startswith(("http://", "https://")) else "https://" + u
+    return urlparse(full).netloc or u
+
+
 def _run_scrape(urls_to_process: list[str]) -> None:
     """Process URLs in small batches, writing each result to the DB as it completes.
 
@@ -661,6 +708,12 @@ def _run_scrape(urls_to_process: list[str]) -> None:
                 # Don't wait for stuck workers — they're daemon threads (in
                 # Python 3.9+) so they die with the process. We just move on.
                 ex.shutdown(wait=False, cancel_futures=True)
+
+            # AI niche enrichment for the URLs that succeeded in THIS batch.
+            # Done per-batch (not at the end of the whole scrape) so the user
+            # sees AI-classified results stream in as they go, and so the AI
+            # cost spreads across the scrape rather than spiking at the end.
+            _maybe_enrich_batch_with_ai(state, conn, sid, batch, ticker_lines, ticker)
 
             # Between-batch cleanup: force GC, brief pause
             if batch_idx < total_batches - 1:
@@ -892,6 +945,46 @@ elif conservative_mode:
 else:
     os.environ.pop("SCRAPER_SKIP_JS", None)
     os.environ.pop("SCRAPER_LOCAL_CHROME", None)
+
+st.sidebar.markdown("---")
+
+# ── AI niche verification (NVIDIA Build API) ──────────────────────
+st.sidebar.markdown("### 🤖 AI niche verification")
+ai_enabled = st.sidebar.checkbox(
+    "Cross-check niche with AI",
+    value=False,
+    help="After each batch finishes, send a short context blob (title + meta "
+         "description + body excerpt) to an LLM via NVIDIA Build's OpenAI-"
+         "compatible API. Adds an 'AI Niche' column alongside the existing "
+         "heuristic one so you can compare. Requires an nvapi-* key.",
+)
+ai_api_key = ""
+ai_model = ai_niche.MODELS[0][1]  # default
+if ai_enabled:
+    ai_api_key = st.sidebar.text_input(
+        "NVIDIA Build API key",
+        value=st.session_state.get("ai_api_key", ""),
+        type="password",
+        placeholder="nvapi-...",
+        help="Paste your key from build.nvidia.com. Stored in session state only "
+             "(not persisted to disk).",
+        key="ai_api_key_input",
+    )
+    st.session_state["ai_api_key"] = ai_api_key
+    model_label = st.sidebar.selectbox(
+        "Model",
+        options=[label for label, _ in ai_niche.MODELS],
+        index=0,
+        help="Llama 3.3 70B is a good default. 8B is fastest. Nemotron tuned by NVIDIA.",
+    )
+    ai_model = dict(ai_niche.MODELS)[model_label]
+    if not ai_api_key or not ai_api_key.startswith("nvapi-"):
+        st.sidebar.caption("⚠ Paste a valid `nvapi-...` key to enable AI niche checks.")
+
+# Expose to the scrape-loop helper via session_state (so we don't have to
+# thread these through every function signature).
+st.session_state["ai_enabled_runtime"] = bool(ai_enabled and ai_api_key and ai_api_key.startswith("nvapi-"))
+st.session_state["ai_model_runtime"]   = ai_model
 
 st.sidebar.markdown("---")
 
@@ -1378,8 +1471,8 @@ if results:
 
     # Normalize results — make sure every row has every column, even if the result
     # was scraped before a new column (like "tech" or "niche") was added
-    ALL_FIELDS = ["url", "company", "niche", "people", "emails", "phones",
-                  "socials", "city", "language", "tech", "contact_form"]
+    ALL_FIELDS = ["url", "company", "niche", "ai_niche", "ai_confidence", "people",
+                  "emails", "phones", "socials", "city", "language", "tech", "contact_form"]
     norm_results = [{f: r.get(f, "") for f in ALL_FIELDS} for r in results]
     df = pd.DataFrame(norm_results)
 
@@ -1391,20 +1484,22 @@ if results:
 
     # Friendly column names & order
     df = df.rename(columns={
-        "url":          "Website",
-        "company":      "Company",
-        "niche":        "Niche",
-        "people":       "Key People",
-        "emails":       "Emails",
-        "phones":       "Phones",
-        "socials":      "Socials",
-        "city":         "City",
-        "language":     "Lang",
-        "tech":         "Built With",
-        "contact_form": "Has form",
+        "url":           "Website",
+        "company":       "Company",
+        "niche":         "Niche",
+        "ai_niche":      "AI Niche",
+        "ai_confidence": "AI Conf",
+        "people":        "Key People",
+        "emails":        "Emails",
+        "phones":        "Phones",
+        "socials":       "Socials",
+        "city":          "City",
+        "language":      "Lang",
+        "tech":          "Built With",
+        "contact_form":  "Has form",
     })
-    preferred = ["Website", "Company", "Niche", "Key People", "Emails", "Phones",
-                 "City", "Built With", "Lang", "Has form", "Socials"]
+    preferred = ["Website", "Company", "Niche", "AI Niche", "AI Conf", "Key People",
+                 "Emails", "Phones", "City", "Built With", "Lang", "Has form", "Socials"]
     df = df[[c for c in preferred if c in df.columns]]
 
     st.dataframe(

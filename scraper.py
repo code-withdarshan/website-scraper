@@ -1263,6 +1263,39 @@ def _detect_tech(soup: BeautifulSoup, raw_html: str) -> list[str]:
     return found[:5]
 
 
+# ── AI context blob — small slice of page content for LLM classifiers ──
+def _build_ai_context(soup: BeautifulSoup) -> str:
+    """Extract a compact text excerpt of the page suitable for an LLM prompt.
+
+    Returns up to ~1500 chars total: page title + meta description + first
+    H1 + first paragraph(s) of visible body text. Strips scripts/styles so
+    the LLM doesn't waste tokens on JS source.
+    """
+    parts: list[str] = []
+    if (t := soup.find("title")) and t.string:
+        parts.append(f"TITLE: {t.string.strip()[:200]}")
+    for meta in soup.find_all("meta"):
+        name = (meta.get("name") or meta.get("property") or "").lower()
+        if name in ("description", "og:description", "twitter:description"):
+            v = (meta.get("content") or "").strip()
+            if v:
+                parts.append(f"DESC: {v[:300]}")
+                break
+    if (h1 := soup.find("h1")):
+        h1_text = h1.get_text(" ", strip=True)
+        if h1_text:
+            parts.append(f"H1: {h1_text[:200]}")
+    # Strip non-content elements before grabbing body text
+    soup_copy = BeautifulSoup(str(soup), "html.parser")
+    for tag in soup_copy(["script", "style", "noscript", "nav", "footer", "header"]):
+        tag.decompose()
+    body_text = soup_copy.get_text(" ", strip=True)
+    body_text = " ".join(body_text.split())  # collapse whitespace
+    if body_text:
+        parts.append(f"BODY: {body_text[:800]}")
+    return "\n".join(parts)[:1500]
+
+
 # ── Contact form detection ─────────────────────────────────────────
 def _has_contact_form(soup: BeautifulSoup) -> bool:
     """Returns True if the page looks like it has a working contact form."""
@@ -1334,6 +1367,7 @@ def scrape_url(url: str) -> dict | None:
     people        = list(_extract_people(home_soup, allow_full_page=False))
     tech          = _detect_tech(home_soup, home_html)
     niche         = _detect_niche(home_soup, home_html)
+    ai_context    = _build_ai_context(home_soup)
 
     # ── 2. Contact page ─────────────────────────────────────────
     contact_url = _find_subpage(home_soup, base_url, CONTACT_LINK_RE)
@@ -1421,6 +1455,7 @@ def scrape_url(url: str) -> dict | None:
         "url":          domain,
         "company":      company,
         "niche":        niche,
+        "_ai_context":  ai_context,
         "people":       ", ".join(seen_people[:5]),
         "emails":       ", ".join(sorted(clean_emails)),
         "phones":       ", ".join(_dedup_phones(phones)) if phones else "",
