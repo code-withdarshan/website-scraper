@@ -608,8 +608,12 @@ def _run_scrape(urls_to_process: list[str]) -> None:
             # forever and the whole scrape would stop dead — this is the
             # actual cause of "stops at 100" with BATCH_SIZE=25 (4 × 25 = 100).
             #
-            # 60s per URL × batch_size, clamped to 5 minutes, with a 30s floor.
-            batch_timeout_sec = max(30, min(300, 60 * len(batch)))
+            # 90s per URL × batch_size, clamped to 15 minutes, with a 60s floor.
+            # Was 60s × batch capped at 300s, but with multi-page scrape_url
+            # (homepage + maybe contact + maybe about, each with retries) a
+            # genuinely slow URL can need 100-180s alone — the old 300s cap
+            # was timing out batches before slow-but-real URLs could finish.
+            batch_timeout_sec = max(60, min(900, 90 * len(batch)))
 
             # NOTE: not using `with ThreadPoolExecutor` — its __exit__ calls
             # shutdown(wait=True) which would itself block on stuck workers
